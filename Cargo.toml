@@ -9,6 +9,7 @@ repository = "https://github.com/ChristiantangCC/tidyup"
 readme = "README.md"
 keywords = ["cli", "port", "kill-port", "node_modules", "cleanup"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["assets/", "demo/", ".github/"]
 
 [dependencies]
 anyhow = "1.0.104"
