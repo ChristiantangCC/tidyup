@@ -341,27 +341,36 @@ fn measure(path: PathBuf, rule: &'static Rule) -> Junk {
 /// of its links are inside `path` (Cargo links outputs within `target/`); one linked from
 /// elsewhere, like pnpm's store, stays on disk after the delete.
 pub(crate) fn disk_usage(path: &Path) -> u64 {
-    let mut total = 0;
-    // (device, inode) → (links seen inside `path`, size)
-    let mut linked: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+    usage_of(path, &Mutex::new(HashMap::new()))
+}
 
-    for meta in WalkDir::new(path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-    {
-        let size = meta.blocks() * 512;
-        if meta.is_dir() || meta.nlink() == 1 {
-            total += size;
-            continue;
-        }
-        let (seen, _) = linked.entry((meta.dev(), meta.ino())).or_insert((0, size));
-        *seen += 1;
-        if *seen == meta.nlink() {
-            total += size;
-        }
-    }
-    total
+/// Walks `dir` with its subfolders measured in parallel, since big caches hold millions
+/// of files. `linked` counts the links seen so far per (device, inode).
+fn usage_of(dir: &Path, linked: &Mutex<HashMap<(u64, u64), u64>>) -> u64 {
+    let own = fs::symlink_metadata(dir).map_or(0, |meta| meta.blocks() * 512);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return own;
+    };
+    let entries: Vec<fs::DirEntry> = entries.flatten().collect();
+    own + entries
+        .into_par_iter()
+        .map(|entry| {
+            let Ok(meta) = entry.metadata() else {
+                return 0;
+            };
+            if meta.is_dir() {
+                return usage_of(&entry.path(), linked);
+            }
+            let size = meta.blocks() * 512;
+            if meta.nlink() == 1 {
+                return size;
+            }
+            let mut seen = linked.lock().unwrap();
+            let count = seen.entry((meta.dev(), meta.ino())).or_insert(0);
+            *count += 1;
+            if *count == meta.nlink() { size } else { 0 }
+        })
+        .sum::<u64>()
 }
 
 /// Newest modification time among the project's other top-level entries.
