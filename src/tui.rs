@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use crate::{
+    caches,
     clean::{self, Junk},
     fmt,
     ports::{self, Listener, Outcome},
@@ -91,6 +92,8 @@ struct App {
     deleting: HashSet<PathBuf>,
     junk_table: TableState,
     sort: SortBy,
+    /// Whether the Clean tab also lists global caches.
+    caches: bool,
     /// Biggest / oldest first.
     descending: bool,
     /// Id of the current scan, so results from a replaced scan are ignored.
@@ -120,6 +123,7 @@ impl App {
             deleting: HashSet::new(),
             junk_table: TableState::default().with_selected(0),
             sort: SortBy::Size,
+            caches: false,
             descending: true,
             scan: 0,
             scanning: false,
@@ -161,12 +165,18 @@ impl App {
         self.junk.clear();
         self.marked.clear();
         let (scan, root, tx) = (self.scan, self.root.clone(), self.tx.clone());
+        let include_caches = self.caches;
         thread::spawn(move || {
-            clean::scan(&root, |junk| {
+            let send = |junk: Junk| {
                 if junk.size > 0 {
                     let _ = tx.send(Msg::Found { scan, junk });
                 }
-            });
+            };
+            if include_caches {
+                rayon::join(|| clean::scan(&root, send), || caches::scan(send));
+            } else {
+                clean::scan(&root, send);
+            }
             let _ = tx.send(Msg::ScanDone { scan });
         });
     }
@@ -184,20 +194,21 @@ impl App {
     }
 
     fn delete(&mut self, paths: Vec<PathBuf>) {
-        let jobs: Vec<(PathBuf, u64)> = self
+        let jobs: Vec<Junk> = self
             .junk
             .iter()
             .filter(|j| paths.contains(&j.path))
-            .map(|j| (j.path.clone(), j.size))
+            .cloned()
             .collect();
-        for (path, _) in &jobs {
-            self.marked.remove(path);
-            self.deleting.insert(path.clone());
+        for junk in &jobs {
+            self.marked.remove(&junk.path);
+            self.deleting.insert(junk.path.clone());
         }
         let tx = self.tx.clone();
         thread::spawn(move || {
-            for (path, size) in jobs {
-                let result = clean::delete(&path).map_err(|e| e.to_string());
+            for junk in jobs {
+                let result = clean::delete(&junk).map_err(|e| e.to_string());
+                let (path, size) = (junk.path, junk.size);
                 let _ = tx.send(Msg::Deleted { path, size, result });
             }
         });
@@ -324,6 +335,10 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.start_scan(),
+            KeyCode::Char('c') => {
+                self.caches = !self.caches;
+                self.start_scan();
+            }
             KeyCode::Char('s') => self.sort_by(SortBy::Size),
             KeyCode::Char('t') => self.sort_by(SortBy::Age),
             _ => {}
@@ -618,6 +633,7 @@ impl App {
                         "sort age"
                     },
                 ),
+                ("c", if self.caches { "hide caches" } else { "caches" }),
                 ("r", "rescan"),
                 ("tab", "switch"),
                 ("q", "quit"),

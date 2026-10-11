@@ -11,7 +11,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{clean::Junk, ports::Listener, ports::Outcome};
+use crate::{
+    clean::{Junk, Source},
+    ports::Listener,
+    ports::Outcome,
+};
 
 const MB: u64 = 1_000_000;
 const DAY: u64 = 86_400;
@@ -193,6 +197,7 @@ fn junk(root: &Path) -> Vec<Junk> {
             kind,
             size: mb * MB,
             last_used: now - Duration::from_secs(days * DAY + 3600),
+            source: Source::Project,
         })
         .collect()
 }
@@ -205,18 +210,44 @@ pub fn scan(root: &Path, on_found: impl Fn(Junk)) {
     }
 }
 
-/// Pretends to delete `path`, counting its size into `freed` over about a second.
-pub fn delete(path: &Path, freed: &AtomicU64) {
-    let size = path
-        .parent()
-        .and_then(|project| project.parent())
-        .map(junk)
-        .and_then(|all| all.into_iter().find(|j| j.path == path))
-        .map_or(100 * MB, |j| j.size);
+/// Pretends to delete `junk`, counting its size into `freed` over about a second.
+pub fn delete(junk: &Junk, freed: &AtomicU64) {
     let steps = 25;
-    let pause = Duration::from_millis(300 + size / (4 * MB)) / steps;
+    let pause = Duration::from_millis(300 + junk.size / (4 * MB)) / steps;
     for _ in 0..steps {
         thread::sleep(pause);
-        freed.fetch_add(size / steps as u64, Ordering::Relaxed);
+        freed.fetch_add(junk.size / steps as u64, Ordering::Relaxed);
+    }
+}
+
+/// Made-up global caches for `tidyup clean --caches`.
+pub fn caches(on_found: impl Fn(Junk)) {
+    let home = home();
+    let now = SystemTime::now();
+    let fixtures: [(&str, &'static str, u64, Source); 4] = [
+        (
+            "Library/Developer/Xcode/DerivedData",
+            "Xcode",
+            18_400,
+            Source::Cache,
+        ),
+        (".npm/_cacache", "npm cache", 3_120, Source::Cache),
+        (".cargo/registry/src", "Cargo cache", 2_640, Source::Cache),
+        ("", "Docker", 7_610, Source::Docker),
+    ];
+    for (path, kind, mb, source) in fixtures {
+        thread::sleep(Duration::from_millis(90));
+        let path = if source == Source::Docker {
+            PathBuf::from(crate::caches::DOCKER_LABEL)
+        } else {
+            home.join(path)
+        };
+        on_found(Junk {
+            path,
+            kind,
+            size: mb * MB,
+            last_used: now - Duration::from_secs(2 * DAY),
+            source,
+        });
     }
 }

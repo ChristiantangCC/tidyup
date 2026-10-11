@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::{
-    demo,
+    caches, demo,
     fmt::{self, Paint},
     progress::{self, Progress},
 };
@@ -259,6 +259,18 @@ pub struct Junk {
     pub size: u64,
     /// Last change to the project the folder belongs to.
     pub last_used: SystemTime,
+    pub source: Source,
+}
+
+/// Where a [`Junk`] came from, which decides how it is removed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Source {
+    /// A dependency or build folder inside a project.
+    Project,
+    /// A global cache folder (see `caches`).
+    Cache,
+    /// Docker's unused images and build cache, removed through `docker` itself.
+    Docker,
 }
 
 fn rule_for(dir: &Path) -> Option<&'static Rule> {
@@ -321,13 +333,14 @@ fn measure(path: PathBuf, rule: &'static Rule) -> Junk {
         last_used: last_used(&path),
         kind: rule.kind,
         path,
+        source: Source::Project,
     }
 }
 
 /// Space on disk that deleting `path` gives back. A hard-linked file counts only when all
 /// of its links are inside `path` (Cargo links outputs within `target/`); one linked from
 /// elsewhere, like pnpm's store, stays on disk after the delete.
-fn disk_usage(path: &Path) -> u64 {
+pub(crate) fn disk_usage(path: &Path) -> u64 {
     let mut total = 0;
     // (device, inode) → (links seen inside `path`, size)
     let mut linked: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
@@ -374,18 +387,23 @@ pub fn scan(root: &Path, on_found: impl Fn(Junk) + Sync) {
         .for_each(|(path, rule)| on_found(measure(path, rule)));
 }
 
-pub fn delete(path: &Path) -> io::Result<()> {
-    delete_counting(path, &AtomicU64::new(0))
+pub fn delete(junk: &Junk) -> io::Result<()> {
+    delete_counting(junk, &AtomicU64::new(0))
 }
 
 /// Deletes `path`, adding each removed entry's size to `freed` as it goes. A hard-linked
 /// file counts once its last link inside `path` is removed, matching `disk_usage`.
-pub fn delete_counting(path: &Path, freed: &AtomicU64) -> io::Result<()> {
+pub fn delete_counting(junk: &Junk, freed: &AtomicU64) -> io::Result<()> {
     if demo::enabled() {
-        demo::delete(path, freed);
+        demo::delete(junk, freed);
         return Ok(());
     }
-    remove_tree(path, freed)
+    if junk.source == Source::Docker {
+        caches::prune_docker()?;
+        freed.fetch_add(junk.size, Ordering::Relaxed);
+        return Ok(());
+    }
+    remove_tree(&junk.path, freed)
 }
 
 /// Deletes a folder tree with its subfolders handled in parallel. Unlinking is limited by
@@ -427,6 +445,8 @@ pub fn display(path: &Path, root: &Path) -> String {
 pub struct Options {
     pub root: PathBuf,
     pub older_than: Option<u64>,
+    /// Also list global caches (Xcode, npm, Cargo, Docker, …).
+    pub caches: bool,
     pub dry_run: bool,
     pub yes: bool,
 }
@@ -436,6 +456,7 @@ pub fn run(options: Options) -> Result<()> {
     let Options {
         root,
         older_than,
+        caches,
         dry_run,
         yes,
     } = options;
@@ -455,17 +476,23 @@ pub fn run(options: Options) -> Result<()> {
         }
     });
     let found = Mutex::new(Vec::new());
-    scan(&root, |junk| {
+    let collect = |junk: Junk| {
         scanned.count.fetch_add(1, Ordering::Relaxed);
         scanned.bytes.fetch_add(junk.size, Ordering::Relaxed);
         found.lock().unwrap().push(junk);
-    });
+    };
+    if caches {
+        rayon::join(|| scan(&root, collect), || caches::scan(collect));
+    } else {
+        scan(&root, collect);
+    }
     drop(progress);
     let mut junk = found.into_inner().unwrap();
 
     if let Some(days) = older_than {
         let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
-        junk.retain(|j| j.last_used < cutoff);
+        // Caches are shared by every project, so a project's age says nothing about them.
+        junk.retain(|j| j.source != Source::Project || j.last_used < cutoff);
     }
     junk.retain(|j| j.size > 0);
     junk.sort_by_key(|j| std::cmp::Reverse(j.size));
@@ -480,7 +507,7 @@ pub fn run(options: Options) -> Result<()> {
         .iter()
         .map(|j| {
             format!(
-                "{:>8}  {:>5}  {:<10} {}",
+                "{:>8}  {:>5}  {:<12} {}",
                 fmt::size(j.size),
                 fmt::age(j.last_used),
                 j.kind,
@@ -498,7 +525,7 @@ pub fn run(options: Options) -> Result<()> {
     let chosen: Vec<&Junk> = if dry_run || yes {
         println!(
             "{}",
-            format!("{:>8}  {:>5}  {:<10} {}", "SIZE", "AGE", "KIND", "PATH").dim()
+            format!("{:>8}  {:>5}  {:<12} {}", "SIZE", "AGE", "KIND", "PATH").dim()
         );
         for line in &lines {
             println!("{line}");
@@ -558,7 +585,7 @@ pub fn run(options: Options) -> Result<()> {
     let results: Vec<(&Junk, io::Result<()>)> = chosen
         .into_par_iter()
         .map(|j| {
-            let result = delete_counting(&j.path, &deleted.bytes);
+            let result = delete_counting(j, &deleted.bytes);
             deleted.count.fetch_add(1, Ordering::Relaxed);
             (j, result)
         })
@@ -665,7 +692,7 @@ mod tests {
         assert_eq!(junk.len(), 1);
         assert!(junk[0].size >= 100_000);
 
-        delete(&junk[0].path).unwrap();
+        delete(&junk[0]).unwrap();
         assert!(!root.join("node_modules").exists());
         assert!(root.join("package.json").exists());
 
