@@ -7,6 +7,7 @@
 Kill whatever is squatting on port 3000. Delete the 40 GB of `node_modules` and `target` folders from projects you forgot about. Start your whole dev stack with one command.
 
 [![CI](https://github.com/ChristiantangCC/tidyup/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristiantangCC/tidyup/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/tidyup.svg)](https://crates.io/crates/tidyup)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 
@@ -33,7 +34,7 @@ tidyup handles both: one small binary, no runtime, no config needed.
 ## Install
 
 ```sh
-cargo install --git https://github.com/ChristiantangCC/tidyup
+cargo install tidyup
 ```
 
 Works on macOS and Linux. It uses `lsof` and `ps`, which both ship with.
