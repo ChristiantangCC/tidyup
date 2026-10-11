@@ -1,0 +1,29 @@
+[package]
+name = "tidyup"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Free up ports and disk space from your dev projects: kill port hogs, delete node_modules/target folders, start your dev stack"
+license = "MIT"
+repository = "https://github.com/ChristiantangCC/tidyup"
+readme = "README.md"
+keywords = ["cli", "port", "kill-port", "node_modules", "cleanup"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+ctrlc = "3.5.2"
+dialoguer = { version = "0.12.0", default-features = false }
+libc = "0.2.190"
+ratatui = "0.30.2"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+walkdir = "2.5.0"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
