@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use crate::{
+    caches,
     clean::{self, Junk},
     fmt,
     ports::{self, Listener, Outcome},
@@ -91,6 +92,8 @@ struct App {
     deleting: HashSet<PathBuf>,
     junk_table: TableState,
     sort: SortBy,
+    /// Whether the Clean tab also lists global caches.
+    caches: bool,
     /// Biggest / oldest first.
     descending: bool,
     /// Id of the current scan, so results from a replaced scan are ignored.
@@ -120,6 +123,7 @@ impl App {
             deleting: HashSet::new(),
             junk_table: TableState::default().with_selected(0),
             sort: SortBy::Size,
+            caches: false,
             descending: true,
             scan: 0,
             scanning: false,
@@ -161,12 +165,18 @@ impl App {
         self.junk.clear();
         self.marked.clear();
         let (scan, root, tx) = (self.scan, self.root.clone(), self.tx.clone());
+        let include_caches = self.caches;
         thread::spawn(move || {
-            clean::scan(&root, |junk| {
+            let send = |junk: Junk| {
                 if junk.size > 0 {
                     let _ = tx.send(Msg::Found { scan, junk });
                 }
-            });
+            };
+            if include_caches {
+                rayon::join(|| clean::scan(&root, send), || caches::scan(send));
+            } else {
+                clean::scan(&root, send);
+            }
             let _ = tx.send(Msg::ScanDone { scan });
         });
     }
@@ -175,29 +185,34 @@ impl App {
         let Some(listener) = self.selected_port().cloned() else {
             return;
         };
-        self.set_status(format!("Stopping {} on :{}…", listener.name, listener.port));
+        self.set_status(format!(
+            "Stopping {} on :{}…",
+            listener.label(),
+            listener.port
+        ));
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = ports::stop(listener.pid, force).map_err(|e| format!("{e:#}"));
+            let result = ports::stop_listener(&listener, force).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Stopped { listener, result });
         });
     }
 
     fn delete(&mut self, paths: Vec<PathBuf>) {
-        let jobs: Vec<(PathBuf, u64)> = self
+        let jobs: Vec<Junk> = self
             .junk
             .iter()
             .filter(|j| paths.contains(&j.path))
-            .map(|j| (j.path.clone(), j.size))
+            .cloned()
             .collect();
-        for (path, _) in &jobs {
-            self.marked.remove(path);
-            self.deleting.insert(path.clone());
+        for junk in &jobs {
+            self.marked.remove(&junk.path);
+            self.deleting.insert(junk.path.clone());
         }
         let tx = self.tx.clone();
         thread::spawn(move || {
-            for (path, size) in jobs {
-                let result = clean::delete(&path).map_err(|e| e.to_string());
+            for junk in jobs {
+                let result = clean::delete(&junk).map_err(|e| e.to_string());
+                let (path, size) = (junk.path, junk.size);
                 let _ = tx.send(Msg::Deleted { path, size, result });
             }
         });
@@ -221,7 +236,7 @@ impl App {
                 Msg::ScanDone { scan } if scan == self.scan => self.scanning = false,
                 Msg::Found { .. } | Msg::ScanDone { .. } => {}
                 Msg::Stopped { listener, result } => {
-                    let name = format!("{} on :{}", listener.name, listener.port);
+                    let name = format!("{} on :{}", listener.label(), listener.port);
                     self.set_status(match result {
                         Ok(Outcome::Stopped) => format!("Stopped {name}"),
                         Ok(Outcome::Forced) => format!("Force-killed {name}"),
@@ -324,6 +339,10 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.start_scan(),
+            KeyCode::Char('c') => {
+                self.caches = !self.caches;
+                self.start_scan();
+            }
             KeyCode::Char('s') => self.sort_by(SortBy::Size),
             KeyCode::Char('t') => self.sort_by(SortBy::Age),
             _ => {}
@@ -449,20 +468,20 @@ impl App {
 
         let name_width = visible
             .iter()
-            .map(|l| l.name.len())
+            .map(|l| l.label().len())
             .max()
             .unwrap_or(0)
-            .clamp(7, 24);
+            .clamp(7, 32);
         let rows: Vec<Row> = visible
             .iter()
             .map(|l| {
                 Row::new([
                     Cell::from(l.port.to_string()).style(Style::new().cyan().bold()),
-                    Cell::from(l.name.clone()),
+                    Cell::from(l.label()),
                     Cell::from(l.pid.to_string()),
-                    Cell::from(l.uptime.map(fmt::duration).unwrap_or_default()),
-                    Cell::from(l.memory.map(fmt::size).unwrap_or_default()),
-                    Cell::from(l.cwd.as_deref().map(fmt::path).unwrap_or_default()),
+                    Cell::from(l.stats().0),
+                    Cell::from(l.stats().1),
+                    Cell::from(l.folder()),
                 ])
             })
             .collect();
@@ -618,6 +637,7 @@ impl App {
                         "sort age"
                     },
                 ),
+                ("c", if self.caches { "hide caches" } else { "caches" }),
                 ("r", "rescan"),
                 ("tab", "switch"),
                 ("q", "quit"),

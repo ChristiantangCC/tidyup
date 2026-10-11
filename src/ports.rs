@@ -34,12 +34,50 @@ pub struct Listener {
     pub uptime: Option<u64>,
     /// Resident memory in bytes.
     pub memory: Option<u64>,
+    /// The Docker container publishing this port, when the listener is Docker's proxy.
+    pub container: Option<String>,
 }
 
 impl Listener {
     /// Daemons and GUI apps run from `/`; dev servers run from a project folder.
     pub fn is_dev(&self) -> bool {
         self.cwd.as_deref().is_some_and(|cwd| cwd != Path::new("/"))
+    }
+
+    /// The project folder, left blank for a container: the process is Docker's own.
+    pub fn folder(&self) -> String {
+        match (&self.container, &self.cwd) {
+            (None, Some(cwd)) => fmt::path(cwd),
+            _ => String::new(),
+        }
+    }
+
+    /// Uptime and memory, left blank for a container: they would be Docker's own.
+    pub fn stats(&self) -> (String, String) {
+        if self.container.is_some() {
+            return (String::new(), String::new());
+        }
+        (
+            self.uptime.map(fmt::duration).unwrap_or_default(),
+            self.memory.map(fmt::size).unwrap_or_default(),
+        )
+    }
+
+    /// The process name, or the container's for a port Docker publishes.
+    pub fn label(&self) -> String {
+        match &self.container {
+            Some(container) => format!("{container} (docker)"),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Whether this is the process Docker publishes container ports through
+    /// (Docker Desktop's backend, docker-proxy, OrbStack, Lima).
+    fn is_docker(&self) -> bool {
+        let name = self.name.to_lowercase();
+        ["docker", "vpnkit", "orbstack", "limactl"]
+            .iter()
+            .any(|engine| name.contains(engine))
     }
 }
 
@@ -79,6 +117,15 @@ pub fn list() -> Result<Vec<Listener>> {
         &["-o", "pid=,etime=,rss=,command=", "-p", &pids],
     )?);
 
+    let containers = if listeners.iter().any(Listener::is_docker) {
+        // Without Docker installed the ports still list, just without container names.
+        run("docker", &["ps", "--format", "{{.Names}}\t{{.Ports}}"])
+            .map(|output| parse_docker_ps(&output))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
     for listener in &mut listeners {
         listener.cwd = cwds.get(&listener.pid).cloned();
         if let Some(stats) = stats.get(&listener.pid) {
@@ -86,8 +133,33 @@ pub fn list() -> Result<Vec<Listener>> {
             listener.memory = Some(stats.memory);
             listener.command.clone_from(&stats.command);
         }
+        if listener.is_docker() {
+            listener.container = containers.get(&listener.port).cloned();
+        }
     }
     Ok(listeners)
+}
+
+/// Stops whatever holds a port. A port Docker publishes is freed by stopping its
+/// container: killing Docker's own process would take every container down with it.
+pub fn stop_listener(listener: &Listener, force: bool) -> Result<Outcome> {
+    if demo::enabled() || !listener.is_docker() {
+        return stop(listener.pid, force);
+    }
+    let Some(container) = &listener.container else {
+        bail!("held by Docker, but no running container publishes this port");
+    };
+    let output = Command::new("docker")
+        .args(["stop", container])
+        .output()
+        .context("could not run `docker`")?;
+    if !output.status.success() {
+        bail!(
+            "docker stop {container} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(Outcome::Stopped)
 }
 
 /// Stops `pid`: SIGTERM, then SIGKILL if it's still around after a grace period.
@@ -151,10 +223,10 @@ pub fn print(all: bool) -> Result<()> {
     } else {
         let name_width = shown
             .iter()
-            .map(|l| l.name.len())
+            .map(|l| l.label().len())
             .max()
             .unwrap_or(0)
-            .clamp(7, 24);
+            .clamp(7, 32);
         println!(
             "{}",
             format!(
@@ -167,11 +239,11 @@ pub fn print(all: bool) -> Result<()> {
             println!(
                 "{} {:<name_width$} {:>7} {:>8} {:>8}  {}",
                 format!("{:<6}", l.port).cyan().bold(),
-                truncate(&l.name, name_width),
+                truncate(&l.label(), name_width),
                 l.pid,
-                l.uptime.map(fmt::duration).unwrap_or_default(),
-                l.memory.map(fmt::size).unwrap_or_default(),
-                l.cwd.as_deref().map(fmt::path).unwrap_or_default().dim(),
+                l.stats().0,
+                l.stats().1,
+                l.folder().dim(),
             );
         }
     }
@@ -201,21 +273,17 @@ pub fn kill(ports: &[u16], force: bool) -> Result<()> {
             println!("{} :{port} nothing listening", "·".dim());
         }
         for l in holders {
-            match stop(l.pid, force) {
-                Ok(Outcome::Stopped) => {
-                    println!("{} :{port} stopped {} (pid {})", "✔".green(), l.name, l.pid)
-                }
-                Ok(Outcome::Forced) => {
-                    println!(
-                        "{} :{port} force-killed {} (pid {})",
-                        "✔".yellow(),
-                        l.name,
-                        l.pid
-                    )
-                }
+            // A container's pid would be Docker's own process, so it's left out.
+            let who = match l.container {
+                Some(_) => l.label(),
+                None => format!("{} (pid {})", l.label(), l.pid),
+            };
+            match stop_listener(l, force) {
+                Ok(Outcome::Stopped) => println!("{} :{port} stopped {who}", "✔".green()),
+                Ok(Outcome::Forced) => println!("{} :{port} force-killed {who}", "✔".yellow()),
                 Err(err) => {
                     failed = true;
-                    eprintln!("{} :{port} {} (pid {}): {err:#}", "✘".red(), l.name, l.pid);
+                    eprintln!("{} :{port} {who}: {err:#}", "✘".red());
                 }
             }
         }
@@ -275,6 +343,7 @@ fn parse_lsof(output: &str) -> Vec<Listener> {
                     command: name.clone(),
                     uptime: None,
                     memory: None,
+                    container: None,
                 });
                 if !listener.addresses.iter().any(|a| a == address) {
                     listener.addresses.push(address.to_string());
@@ -299,6 +368,34 @@ fn parse_cwds(output: &str) -> HashMap<u32, PathBuf> {
         }
     }
     cwds
+}
+
+/// Maps published host ports to container names, from
+/// `docker ps --format '{{.Names}}\t{{.Ports}}'`.
+fn parse_docker_ps(output: &str) -> HashMap<u16, String> {
+    let mut containers = HashMap::new();
+    for line in output.lines() {
+        let Some((name, mappings)) = line.split_once('\t') else {
+            continue;
+        };
+        // e.g. "0.0.0.0:5435->5432/tcp, [::]:5435->5432/tcp, 0.0.0.0:8000-8001->8000-8001/tcp"
+        for mapping in mappings.split(", ") {
+            let Some((host, _)) = mapping.split_once("->") else {
+                continue;
+            };
+            let Some((_, ports)) = host.rsplit_once(':') else {
+                continue;
+            };
+            let (first, last) = ports.split_once('-').unwrap_or((ports, ports));
+            let (Ok(first), Ok(last)) = (first.parse::<u16>(), last.parse::<u16>()) else {
+                continue;
+            };
+            for port in first..=last {
+                containers.insert(port, name.to_string());
+            }
+        }
+    }
+    containers
 }
 
 struct Stats {
@@ -382,6 +479,20 @@ mod tests {
         assert_eq!(node.uptime, Some(3723));
         assert_eq!(node.memory, 20480 * 1024);
         assert_eq!(node.command, "node /app/node_modules/.bin/next dev");
+    }
+
+    #[test]
+    fn maps_docker_ports_to_containers() {
+        let output = "acme-db\t0.0.0.0:5435->5432/tcp, [::]:5435->5432/tcp\n\
+                      cache\t0.0.0.0:6380->6379/tcp\n\
+                      worker\t\n\
+                      api\t0.0.0.0:8000-8001->8000-8001/tcp, 9000/tcp\n";
+        let containers = parse_docker_ps(output);
+        assert_eq!(containers[&5435], "acme-db");
+        assert_eq!(containers[&6380], "cache");
+        assert_eq!(containers[&8000], "api");
+        assert_eq!(containers[&8001], "api");
+        assert_eq!(containers.len(), 4);
     }
 
     #[test]

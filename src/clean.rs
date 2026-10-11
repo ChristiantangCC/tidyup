@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     env, fs, io,
     io::IsTerminal,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -22,12 +22,14 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::{
-    demo,
+    caches, demo,
     fmt::{self, Paint},
     progress::{self, Progress},
 };
 
 /// A deletable folder `dir`, recognised by one of `markers` in the same parent folder.
+/// A marker is a file name, a path such as `ProjectSettings/ProjectVersion.txt`, or a
+/// `*.ext` pattern for project files named after the project (`MyApp.csproj`).
 pub struct Rule {
     pub dir: &'static str,
     pub markers: &'static [&'static str],
@@ -42,6 +44,10 @@ const GRADLE: &[&str] = &[
     "settings.gradle.kts",
 ];
 const PYTHON: &[&str] = &["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"];
+const DOTNET: &[&str] = &["*.csproj", "*.fsproj", "*.vbproj"];
+const CMAKE: &[&str] = &["CMakeLists.txt"];
+const UNITY: &[&str] = &["ProjectSettings/ProjectVersion.txt"];
+const UNREAL: &[&str] = &["*.uproject"];
 
 pub const RULES: &[Rule] = &[
     Rule {
@@ -149,6 +155,96 @@ pub const RULES: &[Rule] = &[
         markers: &["build.zig"],
         kind: "Zig",
     },
+    Rule {
+        dir: "bin",
+        markers: DOTNET,
+        kind: ".NET",
+    },
+    Rule {
+        dir: "obj",
+        markers: DOTNET,
+        kind: ".NET",
+    },
+    Rule {
+        dir: ".build",
+        markers: &["Package.swift"],
+        kind: "Swift",
+    },
+    Rule {
+        dir: "build",
+        markers: CMAKE,
+        kind: "CMake",
+    },
+    Rule {
+        dir: "cmake-build-debug",
+        markers: CMAKE,
+        kind: "CMake",
+    },
+    Rule {
+        dir: "cmake-build-release",
+        markers: CMAKE,
+        kind: "CMake",
+    },
+    Rule {
+        dir: "Library",
+        markers: UNITY,
+        kind: "Unity",
+    },
+    Rule {
+        dir: "Temp",
+        markers: UNITY,
+        kind: "Unity",
+    },
+    Rule {
+        dir: "Binaries",
+        markers: UNREAL,
+        kind: "Unreal",
+    },
+    Rule {
+        dir: "Intermediate",
+        markers: UNREAL,
+        kind: "Unreal",
+    },
+    Rule {
+        dir: "DerivedDataCache",
+        markers: UNREAL,
+        kind: "Unreal",
+    },
+    Rule {
+        dir: ".terraform",
+        markers: &["*.tf"],
+        kind: "Terraform",
+    },
+    Rule {
+        dir: ".stack-work",
+        markers: &["stack.yaml"],
+        kind: "Haskell",
+    },
+    Rule {
+        dir: "dist-newstyle",
+        markers: &["cabal.project", "*.cabal"],
+        kind: "Haskell",
+    },
+    Rule {
+        dir: "target",
+        markers: &["build.sbt"],
+        kind: "Scala",
+    },
+    Rule {
+        dir: ".godot",
+        markers: &["project.godot"],
+        kind: "Godot",
+    },
+    Rule {
+        dir: ".pixi",
+        markers: &["pixi.toml"],
+        kind: "Pixi",
+    },
+    Rule {
+        dir: ".nx",
+        markers: &["nx.json"],
+        kind: "Nx",
+    },
 ];
 
 /// Big folders in the home directory that never contain projects worth scanning.
@@ -163,14 +259,40 @@ pub struct Junk {
     pub size: u64,
     /// Last change to the project the folder belongs to.
     pub last_used: SystemTime,
+    pub source: Source,
+}
+
+/// Where a [`Junk`] came from, which decides how it is removed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Source {
+    /// A dependency or build folder inside a project.
+    Project,
+    /// A global cache folder (see `caches`).
+    Cache,
+    /// Docker's unused images and build cache, removed through `docker` itself.
+    Docker,
 }
 
 fn rule_for(dir: &Path) -> Option<&'static Rule> {
     let name = dir.file_name()?.to_str()?;
     let parent = dir.parent()?;
-    RULES
-        .iter()
-        .find(|rule| rule.dir == name && rule.markers.iter().any(|m| parent.join(m).is_file()))
+    RULES.iter().find(|rule| {
+        rule.dir == name && rule.markers.iter().any(|marker| has_marker(parent, marker))
+    })
+}
+
+fn has_marker(project: &Path, marker: &str) -> bool {
+    let Some(extension) = marker.strip_prefix('*') else {
+        return project.join(marker).is_file();
+    };
+    fs::read_dir(project)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            entry.file_name().to_string_lossy().ends_with(extension)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
 }
 
 /// Hidden folders (`.git`, `.vscode`, `.cargo`, …), app bundles and big media folders.
@@ -211,34 +333,44 @@ fn measure(path: PathBuf, rule: &'static Rule) -> Junk {
         last_used: last_used(&path),
         kind: rule.kind,
         path,
+        source: Source::Project,
     }
 }
 
 /// Space on disk that deleting `path` gives back. A hard-linked file counts only when all
 /// of its links are inside `path` (Cargo links outputs within `target/`); one linked from
 /// elsewhere, like pnpm's store, stays on disk after the delete.
-fn disk_usage(path: &Path) -> u64 {
-    let mut total = 0;
-    // (device, inode) → (links seen inside `path`, size)
-    let mut linked: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+pub(crate) fn disk_usage(path: &Path) -> u64 {
+    usage_of(path, &Mutex::new(HashMap::new()))
+}
 
-    for meta in WalkDir::new(path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-    {
-        let size = meta.blocks() * 512;
-        if meta.is_dir() || meta.nlink() == 1 {
-            total += size;
-            continue;
-        }
-        let (seen, _) = linked.entry((meta.dev(), meta.ino())).or_insert((0, size));
-        *seen += 1;
-        if *seen == meta.nlink() {
-            total += size;
-        }
-    }
-    total
+/// Walks `dir` with its subfolders measured in parallel, since big caches hold millions
+/// of files. `linked` counts the links seen so far per (device, inode).
+fn usage_of(dir: &Path, linked: &Mutex<HashMap<(u64, u64), u64>>) -> u64 {
+    let own = fs::symlink_metadata(dir).map_or(0, |meta| meta.blocks() * 512);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return own;
+    };
+    let entries: Vec<fs::DirEntry> = entries.flatten().collect();
+    own + entries
+        .into_par_iter()
+        .map(|entry| {
+            let Ok(meta) = entry.metadata() else {
+                return 0;
+            };
+            if meta.is_dir() {
+                return usage_of(&entry.path(), linked);
+            }
+            let size = meta.blocks() * 512;
+            if meta.nlink() == 1 {
+                return size;
+            }
+            let mut seen = linked.lock().unwrap();
+            let count = seen.entry((meta.dev(), meta.ino())).or_insert(0);
+            *count += 1;
+            if *count == meta.nlink() { size } else { 0 }
+        })
+        .sum::<u64>()
 }
 
 /// Newest modification time among the project's other top-level entries.
@@ -264,23 +396,34 @@ pub fn scan(root: &Path, on_found: impl Fn(Junk) + Sync) {
         .for_each(|(path, rule)| on_found(measure(path, rule)));
 }
 
-pub fn delete(path: &Path) -> io::Result<()> {
-    delete_counting(path, &AtomicU64::new(0))
+pub fn delete(junk: &Junk) -> io::Result<()> {
+    delete_counting(junk, &AtomicU64::new(0))
 }
 
 /// Deletes `path`, adding each removed entry's size to `freed` as it goes. A hard-linked
 /// file counts once its last link inside `path` is removed, matching `disk_usage`.
-pub fn delete_counting(path: &Path, freed: &AtomicU64) -> io::Result<()> {
+pub fn delete_counting(junk: &Junk, freed: &AtomicU64) -> io::Result<()> {
     if demo::enabled() {
-        demo::delete(path, freed);
+        demo::delete(junk, freed);
         return Ok(());
     }
-    remove_tree(path, freed)
+    if junk.source == Source::Docker {
+        caches::prune_docker()?;
+        freed.fetch_add(junk.size, Ordering::Relaxed);
+        return Ok(());
+    }
+    remove_tree(&junk.path, freed)
 }
 
 /// Deletes a folder tree with its subfolders handled in parallel. Unlinking is limited by
 /// filesystem latency rather than CPU, so many deletes in flight beat one at a time.
 fn remove_tree(dir: &Path, freed: &AtomicU64) -> io::Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    // Go keeps its module cache read-only on purpose; emptying a folder needs write access.
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700))?;
+    }
     let entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
     entries.into_par_iter().try_for_each(|entry| {
         let meta = entry.metadata()?;
@@ -293,9 +436,8 @@ fn remove_tree(dir: &Path, freed: &AtomicU64) -> io::Result<()> {
         }
         Ok(())
     })?;
-    let size = fs::symlink_metadata(dir).map_or(0, |meta| meta.blocks() * 512);
     fs::remove_dir(dir)?;
-    freed.fetch_add(size, Ordering::Relaxed);
+    freed.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
     Ok(())
 }
 
@@ -317,6 +459,10 @@ pub fn display(path: &Path, root: &Path) -> String {
 pub struct Options {
     pub root: PathBuf,
     pub older_than: Option<u64>,
+    /// Also list global caches (Xcode, npm, Cargo, Docker, …).
+    pub caches: bool,
+    /// Move folders to the Trash instead of deleting them.
+    pub trash: bool,
     pub dry_run: bool,
     pub yes: bool,
 }
@@ -326,6 +472,8 @@ pub fn run(options: Options) -> Result<()> {
     let Options {
         root,
         older_than,
+        caches,
+        trash,
         dry_run,
         yes,
     } = options;
@@ -345,17 +493,23 @@ pub fn run(options: Options) -> Result<()> {
         }
     });
     let found = Mutex::new(Vec::new());
-    scan(&root, |junk| {
+    let collect = |junk: Junk| {
         scanned.count.fetch_add(1, Ordering::Relaxed);
         scanned.bytes.fetch_add(junk.size, Ordering::Relaxed);
         found.lock().unwrap().push(junk);
-    });
+    };
+    if caches {
+        rayon::join(|| scan(&root, collect), || caches::scan(collect));
+    } else {
+        scan(&root, collect);
+    }
     drop(progress);
     let mut junk = found.into_inner().unwrap();
 
     if let Some(days) = older_than {
         let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
-        junk.retain(|j| j.last_used < cutoff);
+        // Caches are shared by every project, so a project's age says nothing about them.
+        junk.retain(|j| j.source != Source::Project || j.last_used < cutoff);
     }
     junk.retain(|j| j.size > 0);
     junk.sort_by_key(|j| std::cmp::Reverse(j.size));
@@ -370,7 +524,7 @@ pub fn run(options: Options) -> Result<()> {
         .iter()
         .map(|j| {
             format!(
-                "{:>8}  {:>5}  {:<10} {}",
+                "{:>8}  {:>5}  {:<12} {}",
                 fmt::size(j.size),
                 fmt::age(j.last_used),
                 j.kind,
@@ -388,7 +542,7 @@ pub fn run(options: Options) -> Result<()> {
     let chosen: Vec<&Junk> = if dry_run || yes {
         println!(
             "{}",
-            format!("{:>8}  {:>5}  {:<10} {}", "SIZE", "AGE", "KIND", "PATH").dim()
+            format!("{:>8}  {:>5}  {:<12} {}", "SIZE", "AGE", "KIND", "PATH").dim()
         );
         for line in &lines {
             println!("{line}");
@@ -411,16 +565,27 @@ pub fn run(options: Options) -> Result<()> {
         picked.into_iter().map(|i| &junk[i]).collect()
     };
 
+    let mut chosen = chosen;
+    if trash && chosen.iter().any(|j| j.source == Source::Docker) {
+        chosen.retain(|j| j.source != Source::Docker);
+        eprintln!(
+            "{}",
+            "Skipping Docker: images can't go to the Trash. Run without --trash to prune them."
+                .dim()
+        );
+    }
     if chosen.is_empty() {
         println!("Nothing picked.");
         return Ok(());
     }
 
     let chosen_size: u64 = chosen.iter().map(|j| j.size).sum();
+    let action = if trash { "Move" } else { "Delete" };
+    let destination = if trash { " to the Trash" } else { "" };
     if !yes
         && !Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt(format!(
-                "Delete {} folder{} ({})?",
+                "{action} {} folder{} ({}){destination}?",
                 chosen.len(),
                 plural(chosen.len()),
                 fmt::size(chosen_size)
@@ -429,6 +594,10 @@ pub fn run(options: Options) -> Result<()> {
             .interact()?
     {
         return Ok(());
+    }
+
+    if trash {
+        return run_trash(&chosen);
     }
 
     let deleted = Arc::new(Tally::default());
@@ -448,7 +617,7 @@ pub fn run(options: Options) -> Result<()> {
     let results: Vec<(&Junk, io::Result<()>)> = chosen
         .into_par_iter()
         .map(|j| {
-            let result = delete_counting(&j.path, &deleted.bytes);
+            let result = delete_counting(j, &deleted.bytes);
             deleted.count.fetch_add(1, Ordering::Relaxed);
             (j, result)
         })
@@ -463,6 +632,62 @@ pub fn run(options: Options) -> Result<()> {
     }
     println!("{} Freed {}", "✔".green(), fmt::size(freed).bold());
     Ok(())
+}
+
+/// Moves folders to the Trash one at a time, then says how much emptying it frees.
+fn run_trash(chosen: &[&Junk]) -> Result<()> {
+    let moved = Arc::new(Tally::default());
+    let progress = Progress::start({
+        let (moved, folders) = (moved.clone(), chosen.len());
+        move |spinner| {
+            format!(
+                "{spinner} Moving to the Trash {} · {}/{folders} folders",
+                progress::bar(
+                    moved.count.load(Ordering::Relaxed) as f64 / folders as f64,
+                    24
+                ),
+                moved.count.load(Ordering::Relaxed),
+            )
+        }
+    });
+    let mut size = 0;
+    for junk in chosen {
+        match move_to_trash(junk) {
+            Ok(()) => size += junk.size,
+            Err(err) => eprintln!("{} {}: {err}", "✘".red(), fmt::path(&junk.path)),
+        }
+        moved.count.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(progress);
+    println!(
+        "{} Moved {} to the Trash. Empty it to get the space back.",
+        "✔".green(),
+        fmt::size(size).bold()
+    );
+    Ok(())
+}
+
+fn move_to_trash(junk: &Junk) -> io::Result<()> {
+    if demo::enabled() {
+        demo::delete(junk, &AtomicU64::new(0));
+        return Ok(());
+    }
+    trash_context().delete(&junk.path).map_err(io::Error::other)
+}
+
+/// On macOS, trashes through NSFileManager rather than Finder, which would ask for
+/// permission to control Finder and play the trash sound for every folder.
+#[cfg(target_os = "macos")]
+fn trash_context() -> trash::TrashContext {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut context = trash::TrashContext::new();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_context() -> trash::TrashContext {
+    trash::TrashContext::new()
 }
 
 fn plural(count: usize) -> &'static str {
@@ -514,6 +739,35 @@ mod tests {
     }
 
     #[test]
+    fn matches_project_files_by_extension_and_path() {
+        let root = temp_dir("markers");
+        touch(&root.join("api/Api.csproj"));
+        touch(&root.join("api/bin/Debug/api.dll"));
+        touch(&root.join("game/ProjectSettings/ProjectVersion.txt"));
+        touch(&root.join("game/Library/cache.bin"));
+        touch(&root.join("infra/main.tf"));
+        touch(&root.join("infra/.terraform/providers/x"));
+        touch(&root.join("photos/Library/keep.jpg"));
+        touch(&root.join("scripts/bin/keep.sh"));
+
+        let mut found: Vec<_> = find(&root)
+            .into_iter()
+            .map(|(path, rule)| (display(&path, &root), rule.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("api/bin".to_string(), ".NET"),
+                ("game/Library".to_string(), "Unity"),
+                ("infra/.terraform".to_string(), "Terraform"),
+            ]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn measures_and_deletes() {
         let root = temp_dir("measure");
         touch(&root.join("package.json"));
@@ -526,9 +780,25 @@ mod tests {
         assert_eq!(junk.len(), 1);
         assert!(junk[0].size >= 100_000);
 
-        delete(&junk[0].path).unwrap();
+        delete(&junk[0]).unwrap();
         assert!(!root.join("node_modules").exists());
         assert!(root.join("package.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_read_only_folders() {
+        let root = temp_dir("read-only");
+        touch(&root.join("go.mod"));
+        let module = root.join("vendor/example.com/lib@v1.0.0");
+        touch(&module.join("lib.go"));
+        for dir in [&module, &root.join("vendor/example.com")] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        remove_tree(&root.join("vendor"), &AtomicU64::new(0)).unwrap();
+        assert!(!root.join("vendor").exists());
 
         fs::remove_dir_all(root).unwrap();
     }

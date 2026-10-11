@@ -172,17 +172,19 @@ fn free_ports(services: &[Service]) -> Result<()> {
         .into_iter()
         .filter(|l| wanted.contains(&l.port))
     {
-        ports::stop(holder.pid, false).with_context(|| {
+        ports::stop_listener(&holder, false).with_context(|| {
             format!(
                 "port {} is held by {} (pid {})",
-                holder.port, holder.name, holder.pid
+                holder.port,
+                holder.label(),
+                holder.pid
             )
         })?;
         eprintln!(
             "{} freed :{} (stopped {}, pid {})",
             "✔".green(),
             holder.port,
-            holder.name,
+            holder.label(),
             holder.pid
         );
     }

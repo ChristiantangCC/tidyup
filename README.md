@@ -37,7 +37,7 @@ tidyup handles both: one small binary, no runtime, no config needed.
 cargo install tidyup
 ```
 
-A single 1.5 MB binary with nothing else to install. Works on macOS and Linux, using the `lsof` and `ps` both systems ship with.
+A single 1.6 MB binary with nothing else to install. Works on macOS and Linux, using the `lsof` and `ps` both systems ship with.
 
 ## Ports: what's running, and stop it
 
@@ -53,6 +53,7 @@ tidyup kill 3000 -f   # skip the polite part
 - **Shows the project folder** each process runs from, so you can tell your three `node` processes apart.
 - **Hides system noise.** AirPlay, Spotify and other processes running from `/` stay out of the list unless you pass `--all`.
 - **Stops nicely first.** SIGTERM, a 3 second wait, then SIGKILL only if the process is still around. That's what happened to the stubborn Python server above.
+- **Knows Docker.** A port published by a container shows the container's name, and stopping it runs `docker stop` on that container instead of killing Docker itself.
 
 ## Clean: get your disk back
 
@@ -62,6 +63,8 @@ tidyup kill 3000 -f   # skip the polite part
 tidyup clean ~/code                  # pick from a list, then confirm
 tidyup clean ~/code --older-than 30  # only projects untouched for a month
 tidyup clean ~/code --dry-run        # just show me
+tidyup clean ~/code --caches         # plus Xcode, npm, pnpm, Cargo, Docker and other caches
+tidyup clean ~/code --trash          # move to the Trash instead of deleting
 tidyup clean ~/code --older-than 90 --yes   # no questions asked
 ```
 
@@ -78,6 +81,19 @@ tidyup clean ~/code --older-than 90 --yes   # no questions asked
 | `vendor` | `composer.json` | PHP |
 | `_build` `deps` | `mix.exs` | Elixir |
 | `.zig-cache` `zig-out` | `build.zig` | Zig |
+| `bin` `obj` | `*.csproj` · `*.fsproj` · `*.vbproj` | .NET |
+| `.build` | `Package.swift` | Swift |
+| `build` `cmake-build-debug` `cmake-build-release` | `CMakeLists.txt` | CMake |
+| `Library` `Temp` | `ProjectSettings/ProjectVersion.txt` | Unity |
+| `Binaries` `Intermediate` `DerivedDataCache` | `*.uproject` | Unreal |
+| `.terraform` | `*.tf` | Terraform |
+| `.stack-work` `dist-newstyle` | `stack.yaml` · `cabal.project` · `*.cabal` | Haskell |
+| `target` | `build.sbt` | Scala |
+| `.godot` | `project.godot` | Godot |
+| `.pixi` | `pixi.toml` | Pixi |
+| `.nx` | `nx.json` | Nx |
+
+**Global caches too.** With `--caches`, tidyup also lists the caches your tools keep outside any project: Xcode's DerivedData and simulator caches, npm, pnpm, Yarn, Bun, Cargo, Go, Gradle, Maven, pip, uv, Homebrew and CocoaPods. Docker's unused images and build cache show up as one item, removed with `docker image prune` and `docker builder prune`; volumes and running containers are never touched. On one working Mac this came to 135 GB.
 
 **It never looks inside** hidden folders (`.git`, `.vscode`, `.cargo`, …), `.app` bundles or `~/Library`, so your editor extensions keep their `node_modules`.
 
@@ -128,9 +144,27 @@ Run `tidyup` with no arguments (or `tidyup ui ~/code`) for both tools in one scr
 | `X` | force kill | `a` | mark all |
 | `a` | show/hide system processes | `d` | delete marked (or current) |
 | `r` | refresh | `s` / `t` | sort by size / age, again to flip |
+| | | `c` | show/hide global caches |
 | | | `r` | rescan |
 
 `tab` or `1`/`2` switches tabs, `↑↓` or `j`/`k` moves, `q` quits.
+
+## How it compares
+
+tidyup does three jobs that usually take three tools. If you only need one of them, these are good too.
+
+| | tidyup | [kondo](https://github.com/tbillington/kondo) | [npkill](https://github.com/voidcosmos/npkill) | [kill-port](https://github.com/tiaanduplessis/kill-port) |
+| --- | --- | --- | --- | --- |
+| Deletes dependency and build folders | 28 project types | 20+ project types | Node by default, more via profiles | – |
+| Checks for the project file before deleting | Yes | Yes | No, matches folder names | – |
+| Choosing what to delete | Pick from a list, then confirm | Asks per project | Interactive list | – |
+| Only old projects | `--older-than 30` | `--older 1M` | Sort by age | – |
+| Dry run | Yes | Yes | Yes | – |
+| Package manager and Docker caches | Yes, with `--caches` | – | Some, matched by folder name | – |
+| Stops what's on a port | SIGTERM, then SIGKILL after 3 s | – | – | SIGKILL |
+| Starts your dev stack | `tidyup up` | – | – | – |
+| Install | `cargo install` | Homebrew, winget, cargo | `npx` | `npx` |
+| Windows | No | Yes | Yes | Yes |
 
 ## Contributing
 
