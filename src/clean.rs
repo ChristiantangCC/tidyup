@@ -9,6 +9,10 @@ use std::{
     io::IsTerminal,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -17,7 +21,10 @@ use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::fmt::{self, Paint};
+use crate::{
+    fmt::{self, Paint},
+    progress::{self, Progress},
+};
 
 /// A deletable folder `dir`, recognised by one of `markers` in the same parent folder.
 pub struct Rule {
@@ -254,7 +261,34 @@ pub fn scan(root: &Path, on_found: impl Fn(Junk) + Sync) {
 }
 
 pub fn delete(path: &Path) -> io::Result<()> {
-    fs::remove_dir_all(path)
+    delete_counting(path, &AtomicU64::new(0))
+}
+
+/// Deletes `path`, adding each removed entry's size to `freed` as it goes. A hard-linked
+/// file counts once its last link inside `path` is removed, matching `disk_usage`.
+pub fn delete_counting(path: &Path, freed: &AtomicU64) -> io::Result<()> {
+    for entry in WalkDir::new(path).contents_first(true) {
+        let entry = entry?;
+        let size = entry
+            .metadata()
+            .ok()
+            .filter(|meta| meta.is_dir() || meta.nlink() == 1)
+            .map_or(0, |meta| meta.blocks() * 512);
+        if entry.file_type().is_dir() {
+            fs::remove_dir(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+        freed.fetch_add(size, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Running totals shared with a progress line.
+#[derive(Default)]
+struct Tally {
+    count: AtomicUsize,
+    bytes: AtomicU64,
 }
 
 /// Displays `path` relative to `root` when it's inside it.
@@ -284,9 +318,24 @@ pub fn run(options: Options) -> Result<()> {
         bail!("not running in a terminal: pass --dry-run to list or --yes to delete everything");
     }
 
-    eprintln!("{}", format!("Scanning {}…", fmt::path(&root)).dim());
-    let found = std::sync::Mutex::new(Vec::new());
-    scan(&root, |junk| found.lock().unwrap().push(junk));
+    let scanned = Arc::new(Tally::default());
+    let progress = Progress::start({
+        let (scanned, shown) = (scanned.clone(), fmt::path(&root));
+        move |spinner| {
+            format!(
+                "{spinner} Scanning {shown}… {} found, {}",
+                scanned.count.load(Ordering::Relaxed),
+                fmt::size(scanned.bytes.load(Ordering::Relaxed))
+            )
+        }
+    });
+    let found = Mutex::new(Vec::new());
+    scan(&root, |junk| {
+        scanned.count.fetch_add(1, Ordering::Relaxed);
+        scanned.bytes.fetch_add(junk.size, Ordering::Relaxed);
+        found.lock().unwrap().push(junk);
+    });
+    drop(progress);
     let mut junk = found.into_inner().unwrap();
 
     if let Some(days) = older_than {
@@ -341,6 +390,7 @@ pub fn run(options: Options) -> Result<()> {
             ))
             .items(&lines)
             .max_length(20)
+            .report(false)
             .interact_opt()?;
         let Some(picked) = picked else { return Ok(()) };
         picked.into_iter().map(|i| &junk[i]).collect()
@@ -366,10 +416,29 @@ pub fn run(options: Options) -> Result<()> {
         return Ok(());
     }
 
+    let deleted = Arc::new(Tally::default());
+    let progress = Progress::start({
+        let (deleted, folders) = (deleted.clone(), chosen.len());
+        move |spinner| {
+            let bytes = deleted.bytes.load(Ordering::Relaxed);
+            format!(
+                "{spinner} Deleting {} {} of {} · {}/{folders} folders",
+                progress::bar(bytes as f64 / chosen_size.max(1) as f64, 24),
+                fmt::size(bytes),
+                fmt::size(chosen_size),
+                deleted.count.load(Ordering::Relaxed),
+            )
+        }
+    });
     let results: Vec<(&Junk, io::Result<()>)> = chosen
         .into_par_iter()
-        .map(|j| (j, delete(&j.path)))
+        .map(|j| {
+            let result = delete_counting(&j.path, &deleted.bytes);
+            deleted.count.fetch_add(1, Ordering::Relaxed);
+            (j, result)
+        })
         .collect();
+    drop(progress);
     let mut freed = 0;
     for (junk, result) in results {
         match result {

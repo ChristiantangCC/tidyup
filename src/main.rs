@@ -1,6 +1,7 @@
 mod clean;
 mod fmt;
 mod ports;
+mod progress;
 mod tui;
 mod up;
 
