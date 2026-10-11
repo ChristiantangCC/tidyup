@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     env, fs, io,
     io::IsTerminal,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -418,6 +418,12 @@ pub fn delete_counting(junk: &Junk, freed: &AtomicU64) -> io::Result<()> {
 /// Deletes a folder tree with its subfolders handled in parallel. Unlinking is limited by
 /// filesystem latency rather than CPU, so many deletes in flight beat one at a time.
 fn remove_tree(dir: &Path, freed: &AtomicU64) -> io::Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    // Go keeps its module cache read-only on purpose; emptying a folder needs write access.
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700))?;
+    }
     let entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
     entries.into_par_iter().try_for_each(|entry| {
         let meta = entry.metadata()?;
@@ -430,9 +436,8 @@ fn remove_tree(dir: &Path, freed: &AtomicU64) -> io::Result<()> {
         }
         Ok(())
     })?;
-    let size = fs::symlink_metadata(dir).map_or(0, |meta| meta.blocks() * 512);
     fs::remove_dir(dir)?;
-    freed.fetch_add(size, Ordering::Relaxed);
+    freed.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
     Ok(())
 }
 
@@ -704,6 +709,22 @@ mod tests {
         delete(&junk[0]).unwrap();
         assert!(!root.join("node_modules").exists());
         assert!(root.join("package.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_read_only_folders() {
+        let root = temp_dir("read-only");
+        touch(&root.join("go.mod"));
+        let module = root.join("vendor/example.com/lib@v1.0.0");
+        touch(&module.join("lib.go"));
+        for dir in [&module, &root.join("vendor/example.com")] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        remove_tree(&root.join("vendor"), &AtomicU64::new(0)).unwrap();
+        assert!(!root.join("vendor").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
