@@ -1,4 +1,5 @@
 mod clean;
+mod demo;
 mod fmt;
 mod ports;
 mod progress;

@@ -13,7 +13,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::fmt::{self, Paint};
+use crate::{
+    demo,
+    fmt::{self, Paint},
+};
 
 /// How long a process gets to shut down after SIGTERM before it gets SIGKILL.
 const GRACE: Duration = Duration::from_secs(3);
@@ -51,6 +54,9 @@ pub enum Outcome {
 
 /// All TCP listeners visible to the current user, sorted by port.
 pub fn list() -> Result<Vec<Listener>> {
+    if demo::enabled() {
+        return Ok(demo::listeners());
+    }
     let mut listeners = parse_lsof(&run(
         "lsof",
         &["-nP", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-Fpcn"],
@@ -89,6 +95,9 @@ pub fn list() -> Result<Vec<Listener>> {
 pub fn stop(pid: u32, force: bool) -> Result<Outcome> {
     if pid <= 1 || pid == std::process::id() {
         bail!("refusing to stop pid {pid}");
+    }
+    if demo::enabled() {
+        return Ok(demo::stop(pid, force));
     }
     if !force && (!signal(pid, libc::SIGTERM)? || wait_for_exit(pid, GRACE)) {
         return Ok(Outcome::Stopped);

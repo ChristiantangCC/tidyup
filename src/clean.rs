@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::{
+    demo,
     fmt::{self, Paint},
     progress::{self, Progress},
 };
@@ -255,6 +256,9 @@ fn last_used(junk: &Path) -> SystemTime {
 
 /// Scans `root`, calling `on_found` from worker threads as each folder is measured.
 pub fn scan(root: &Path, on_found: impl Fn(Junk) + Sync) {
+    if demo::enabled() {
+        return demo::scan(root, on_found);
+    }
     find(root)
         .into_par_iter()
         .for_each(|(path, rule)| on_found(measure(path, rule)));
@@ -267,6 +271,10 @@ pub fn delete(path: &Path) -> io::Result<()> {
 /// Deletes `path`, adding each removed entry's size to `freed` as it goes. A hard-linked
 /// file counts once its last link inside `path` is removed, matching `disk_usage`.
 pub fn delete_counting(path: &Path, freed: &AtomicU64) -> io::Result<()> {
+    if demo::enabled() {
+        demo::delete(path, freed);
+        return Ok(());
+    }
     remove_tree(path, freed)
 }
 
