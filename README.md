@@ -78,6 +78,17 @@ tidyup clean ~/code --older-than 90 --yes   # no questions asked
 | `vendor` | `composer.json` | PHP |
 | `_build` `deps` | `mix.exs` | Elixir |
 | `.zig-cache` `zig-out` | `build.zig` | Zig |
+| `bin` `obj` | `*.csproj` · `*.fsproj` · `*.vbproj` | .NET |
+| `.build` | `Package.swift` | Swift |
+| `build` `cmake-build-debug` `cmake-build-release` | `CMakeLists.txt` | CMake |
+| `Library` `Temp` | `ProjectSettings/ProjectVersion.txt` | Unity |
+| `Binaries` `Intermediate` `DerivedDataCache` | `*.uproject` | Unreal |
+| `.terraform` | `*.tf` | Terraform |
+| `.stack-work` `dist-newstyle` | `stack.yaml` · `cabal.project` · `*.cabal` | Haskell |
+| `target` | `build.sbt` | Scala |
+| `.godot` | `project.godot` | Godot |
+| `.pixi` | `pixi.toml` | Pixi |
+| `.nx` | `nx.json` | Nx |
 
 **It never looks inside** hidden folders (`.git`, `.vscode`, `.cargo`, …), `.app` bundles or `~/Library`, so your editor extensions keep their `node_modules`.
 

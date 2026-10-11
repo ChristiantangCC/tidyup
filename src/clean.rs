@@ -28,6 +28,8 @@ use crate::{
 };
 
 /// A deletable folder `dir`, recognised by one of `markers` in the same parent folder.
+/// A marker is a file name, a path such as `ProjectSettings/ProjectVersion.txt`, or a
+/// `*.ext` pattern for project files named after the project (`MyApp.csproj`).
 pub struct Rule {
     pub dir: &'static str,
     pub markers: &'static [&'static str],
@@ -42,6 +44,10 @@ const GRADLE: &[&str] = &[
     "settings.gradle.kts",
 ];
 const PYTHON: &[&str] = &["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"];
+const DOTNET: &[&str] = &["*.csproj", "*.fsproj", "*.vbproj"];
+const CMAKE: &[&str] = &["CMakeLists.txt"];
+const UNITY: &[&str] = &["ProjectSettings/ProjectVersion.txt"];
+const UNREAL: &[&str] = &["*.uproject"];
 
 pub const RULES: &[Rule] = &[
     Rule {
@@ -149,6 +155,96 @@ pub const RULES: &[Rule] = &[
         markers: &["build.zig"],
         kind: "Zig",
     },
+    Rule {
+        dir: "bin",
+        markers: DOTNET,
+        kind: ".NET",
+    },
+    Rule {
+        dir: "obj",
+        markers: DOTNET,
+        kind: ".NET",
+    },
+    Rule {
+        dir: ".build",
+        markers: &["Package.swift"],
+        kind: "Swift",
+    },
+    Rule {
+        dir: "build",
+        markers: CMAKE,
+        kind: "CMake",
+    },
+    Rule {
+        dir: "cmake-build-debug",
+        markers: CMAKE,
+        kind: "CMake",
+    },
+    Rule {
+        dir: "cmake-build-release",
+        markers: CMAKE,
+        kind: "CMake",
+    },
+    Rule {
+        dir: "Library",
+        markers: UNITY,
+        kind: "Unity",
+    },
+    Rule {
+        dir: "Temp",
+        markers: UNITY,
+        kind: "Unity",
+    },
+    Rule {
+        dir: "Binaries",
+        markers: UNREAL,
+        kind: "Unreal",
+    },
+    Rule {
+        dir: "Intermediate",
+        markers: UNREAL,
+        kind: "Unreal",
+    },
+    Rule {
+        dir: "DerivedDataCache",
+        markers: UNREAL,
+        kind: "Unreal",
+    },
+    Rule {
+        dir: ".terraform",
+        markers: &["*.tf"],
+        kind: "Terraform",
+    },
+    Rule {
+        dir: ".stack-work",
+        markers: &["stack.yaml"],
+        kind: "Haskell",
+    },
+    Rule {
+        dir: "dist-newstyle",
+        markers: &["cabal.project", "*.cabal"],
+        kind: "Haskell",
+    },
+    Rule {
+        dir: "target",
+        markers: &["build.sbt"],
+        kind: "Scala",
+    },
+    Rule {
+        dir: ".godot",
+        markers: &["project.godot"],
+        kind: "Godot",
+    },
+    Rule {
+        dir: ".pixi",
+        markers: &["pixi.toml"],
+        kind: "Pixi",
+    },
+    Rule {
+        dir: ".nx",
+        markers: &["nx.json"],
+        kind: "Nx",
+    },
 ];
 
 /// Big folders in the home directory that never contain projects worth scanning.
@@ -168,9 +264,23 @@ pub struct Junk {
 fn rule_for(dir: &Path) -> Option<&'static Rule> {
     let name = dir.file_name()?.to_str()?;
     let parent = dir.parent()?;
-    RULES
-        .iter()
-        .find(|rule| rule.dir == name && rule.markers.iter().any(|m| parent.join(m).is_file()))
+    RULES.iter().find(|rule| {
+        rule.dir == name && rule.markers.iter().any(|marker| has_marker(parent, marker))
+    })
+}
+
+fn has_marker(project: &Path, marker: &str) -> bool {
+    let Some(extension) = marker.strip_prefix('*') else {
+        return project.join(marker).is_file();
+    };
+    fs::read_dir(project)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            entry.file_name().to_string_lossy().ends_with(extension)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
 }
 
 /// Hidden folders (`.git`, `.vscode`, `.cargo`, …), app bundles and big media folders.
@@ -507,6 +617,35 @@ mod tests {
             [
                 ("cli/target".to_string(), "Rust"),
                 ("web/node_modules".to_string(), "Node")
+            ]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matches_project_files_by_extension_and_path() {
+        let root = temp_dir("markers");
+        touch(&root.join("api/Api.csproj"));
+        touch(&root.join("api/bin/Debug/api.dll"));
+        touch(&root.join("game/ProjectSettings/ProjectVersion.txt"));
+        touch(&root.join("game/Library/cache.bin"));
+        touch(&root.join("infra/main.tf"));
+        touch(&root.join("infra/.terraform/providers/x"));
+        touch(&root.join("photos/Library/keep.jpg"));
+        touch(&root.join("scripts/bin/keep.sh"));
+
+        let mut found: Vec<_> = find(&root)
+            .into_iter()
+            .map(|(path, rule)| (display(&path, &root), rule.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("api/bin".to_string(), ".NET"),
+                ("game/Library".to_string(), "Unity"),
+                ("infra/.terraform".to_string(), "Terraform"),
             ]
         );
 
