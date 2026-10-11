@@ -44,6 +44,13 @@ enum Tab {
     Clean,
 }
 
+/// Column the Clean tab is sorted by.
+#[derive(Clone, Copy, PartialEq)]
+enum SortBy {
+    Size,
+    Age,
+}
+
 /// Results coming back from background threads.
 enum Msg {
     Ports(Result<Vec<Listener>, String>),
@@ -83,6 +90,9 @@ struct App {
     marked: HashSet<PathBuf>,
     deleting: HashSet<PathBuf>,
     junk_table: TableState,
+    sort: SortBy,
+    /// Biggest / oldest first.
+    descending: bool,
     /// Id of the current scan, so results from a replaced scan are ignored.
     scan: u64,
     scanning: bool,
@@ -109,6 +119,8 @@ impl App {
             marked: HashSet::new(),
             deleting: HashSet::new(),
             junk_table: TableState::default().with_selected(0),
+            sort: SortBy::Size,
+            descending: true,
             scan: 0,
             scanning: false,
             confirm: None,
@@ -203,13 +215,8 @@ impl App {
                     }
                 }
                 Msg::Found { scan, junk } if scan == self.scan => {
-                    let selected = self.selected_junk().map(|j| j.path.clone());
                     self.junk.push(junk);
-                    self.junk.sort_by_key(|j| std::cmp::Reverse(j.size));
-                    if let Some(selected) = selected {
-                        let index = self.junk.iter().position(|j| j.path == selected);
-                        self.junk_table.select(index);
-                    }
+                    self.sort_junk();
                 }
                 Msg::ScanDone { scan } if scan == self.scan => self.scanning = false,
                 Msg::Found { .. } | Msg::ScanDone { .. } => {}
@@ -317,6 +324,8 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.start_scan(),
+            KeyCode::Char('s') => self.sort_by(SortBy::Size),
+            KeyCode::Char('t') => self.sort_by(SortBy::Age),
             _ => {}
         }
     }
@@ -345,6 +354,36 @@ impl App {
 
     fn selected_junk(&self) -> Option<&Junk> {
         self.junk.get(self.junk_table.selected()?)
+    }
+
+    /// Sorts by `column`, or flips the direction if it's already the sort column.
+    fn sort_by(&mut self, column: SortBy) {
+        if self.sort == column {
+            self.descending = !self.descending;
+        } else {
+            self.sort = column;
+            self.descending = true;
+        }
+        self.sort_junk();
+    }
+
+    /// Re-sorts the Clean list, keeping the same folder selected.
+    fn sort_junk(&mut self) {
+        let selected = self.selected_junk().map(|j| j.path.clone());
+        let (sort, descending) = (self.sort, self.descending);
+        self.junk.sort_by(|a, b| {
+            let order = match sort {
+                SortBy::Size => a.size.cmp(&b.size),
+                // Older means more age, so compare timestamps the other way round.
+                SortBy::Age => b.last_used.cmp(&a.last_used),
+            };
+            let order = if descending { order.reverse() } else { order };
+            order.then_with(|| b.size.cmp(&a.size))
+        });
+        if let Some(selected) = selected {
+            let index = self.junk.iter().position(|j| j.path == selected);
+            self.junk_table.select(index);
+        }
     }
 
     fn set_status(&mut self, text: String) {
@@ -512,7 +551,23 @@ impl App {
                 Constraint::Fill(1),
             ],
         )
-        .header(Row::new(["", "SIZE", "AGE", "KIND", "PATH"]).dim())
+        .header(
+            Row::new({
+                let arrow = if self.descending { "↓" } else { "↑" };
+                let (size, age) = match self.sort {
+                    SortBy::Size => (format!("SIZE {arrow}"), "AGE".to_string()),
+                    SortBy::Age => ("SIZE".to_string(), format!("AGE {arrow}")),
+                };
+                [
+                    String::new(),
+                    size,
+                    age,
+                    "KIND".to_string(),
+                    "PATH".to_string(),
+                ]
+            })
+            .dim(),
+        )
         .block(block)
         .row_highlight_style(Style::new().reversed())
         .highlight_symbol("› ");
@@ -547,6 +602,22 @@ impl App {
                 ("space", "mark"),
                 ("a", "mark all"),
                 ("d", "delete"),
+                (
+                    "s",
+                    if self.sort == SortBy::Size {
+                        "flip size"
+                    } else {
+                        "sort size"
+                    },
+                ),
+                (
+                    "t",
+                    if self.sort == SortBy::Age {
+                        "flip age"
+                    } else {
+                        "sort age"
+                    },
+                ),
                 ("r", "rescan"),
                 ("tab", "switch"),
                 ("q", "quit"),

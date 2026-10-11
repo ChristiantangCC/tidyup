@@ -90,7 +90,8 @@ env = { LOG_LEVEL = "debug" }
 | `x` | stop | `space` | mark |
 | `X` | force kill | `a` | mark all |
 | `a` | show/hide system processes | `d` | delete marked (or current) |
-| `r` | refresh (also every 2s) | `r` | rescan |
+| `r` | refresh (also every 2s) | `s` / `t` | sort by size / age, press again to flip |
+| | | `r` | rescan |
 
 ## License
 
