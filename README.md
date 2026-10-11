@@ -37,7 +37,7 @@ tidyup handles both: one small binary, no runtime, no config needed.
 cargo install tidyup
 ```
 
-Works on macOS and Linux. It uses `lsof` and `ps`, which both ship with.
+A single 1.5 MB binary with nothing else to install. Works on macOS and Linux, using the `lsof` and `ps` both systems ship with.
 
 ## Ports: what's running, and stop it
 
