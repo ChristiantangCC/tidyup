@@ -45,6 +45,7 @@ pub fn listeners() -> Vec<Listener> {
     let code = home().join("code");
     let homebrew = Path::new("/opt/homebrew/var");
     let root = Path::new("/");
+    let docker = home().join("Library/Containers/com.docker.docker/Data");
     let stopped = stopped();
     [
         fake(
@@ -110,6 +111,18 @@ pub fn listeners() -> Vec<Listener> {
             96,
             "wrangler dev",
         ),
+        Listener {
+            container: Some("acme-mongo".to_string()),
+            ..fake(
+                27017,
+                975,
+                "com.docker.backend",
+                &docker,
+                640_000,
+                143,
+                "docker",
+            )
+        },
         fake(
             5000,
             611,
@@ -153,6 +166,7 @@ fn fake(
         command: command.to_string(),
         uptime: Some(uptime),
         memory: Some(mb * MB),
+        container: None,
     }
 }
 

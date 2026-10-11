@@ -185,10 +185,14 @@ impl App {
         let Some(listener) = self.selected_port().cloned() else {
             return;
         };
-        self.set_status(format!("Stopping {} on :{}…", listener.name, listener.port));
+        self.set_status(format!(
+            "Stopping {} on :{}…",
+            listener.label(),
+            listener.port
+        ));
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = ports::stop(listener.pid, force).map_err(|e| format!("{e:#}"));
+            let result = ports::stop_listener(&listener, force).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Stopped { listener, result });
         });
     }
@@ -232,7 +236,7 @@ impl App {
                 Msg::ScanDone { scan } if scan == self.scan => self.scanning = false,
                 Msg::Found { .. } | Msg::ScanDone { .. } => {}
                 Msg::Stopped { listener, result } => {
-                    let name = format!("{} on :{}", listener.name, listener.port);
+                    let name = format!("{} on :{}", listener.label(), listener.port);
                     self.set_status(match result {
                         Ok(Outcome::Stopped) => format!("Stopped {name}"),
                         Ok(Outcome::Forced) => format!("Force-killed {name}"),
@@ -464,20 +468,20 @@ impl App {
 
         let name_width = visible
             .iter()
-            .map(|l| l.name.len())
+            .map(|l| l.label().len())
             .max()
             .unwrap_or(0)
-            .clamp(7, 24);
+            .clamp(7, 32);
         let rows: Vec<Row> = visible
             .iter()
             .map(|l| {
                 Row::new([
                     Cell::from(l.port.to_string()).style(Style::new().cyan().bold()),
-                    Cell::from(l.name.clone()),
+                    Cell::from(l.label()),
                     Cell::from(l.pid.to_string()),
-                    Cell::from(l.uptime.map(fmt::duration).unwrap_or_default()),
-                    Cell::from(l.memory.map(fmt::size).unwrap_or_default()),
-                    Cell::from(l.cwd.as_deref().map(fmt::path).unwrap_or_default()),
+                    Cell::from(l.stats().0),
+                    Cell::from(l.stats().1),
+                    Cell::from(l.folder()),
                 ])
             })
             .collect();
