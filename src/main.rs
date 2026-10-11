@@ -49,6 +49,9 @@ enum Command {
         /// Also list global caches: Xcode, npm, pnpm, Yarn, Cargo, Go, Gradle, pip, Homebrew, Docker, …
         #[arg(short, long)]
         caches: bool,
+        /// Move folders to the Trash instead of deleting them
+        #[arg(long)]
+        trash: bool,
         /// List what would be deleted, delete nothing
         #[arg(short = 'n', long)]
         dry_run: bool,
@@ -83,12 +86,14 @@ fn main() -> Result<()> {
             path,
             older_than,
             caches,
+            trash,
             dry_run,
             yes,
         }) => clean::run(clean::Options {
             root: folder(path)?,
             older_than,
             caches,
+            trash,
             dry_run,
             yes,
         }),

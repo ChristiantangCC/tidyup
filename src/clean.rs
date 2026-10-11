@@ -461,6 +461,8 @@ pub struct Options {
     pub older_than: Option<u64>,
     /// Also list global caches (Xcode, npm, Cargo, Docker, …).
     pub caches: bool,
+    /// Move folders to the Trash instead of deleting them.
+    pub trash: bool,
     pub dry_run: bool,
     pub yes: bool,
 }
@@ -471,6 +473,7 @@ pub fn run(options: Options) -> Result<()> {
         root,
         older_than,
         caches,
+        trash,
         dry_run,
         yes,
     } = options;
@@ -562,16 +565,27 @@ pub fn run(options: Options) -> Result<()> {
         picked.into_iter().map(|i| &junk[i]).collect()
     };
 
+    let mut chosen = chosen;
+    if trash && chosen.iter().any(|j| j.source == Source::Docker) {
+        chosen.retain(|j| j.source != Source::Docker);
+        eprintln!(
+            "{}",
+            "Skipping Docker: images can't go to the Trash. Run without --trash to prune them."
+                .dim()
+        );
+    }
     if chosen.is_empty() {
         println!("Nothing picked.");
         return Ok(());
     }
 
     let chosen_size: u64 = chosen.iter().map(|j| j.size).sum();
+    let action = if trash { "Move" } else { "Delete" };
+    let destination = if trash { " to the Trash" } else { "" };
     if !yes
         && !Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt(format!(
-                "Delete {} folder{} ({})?",
+                "{action} {} folder{} ({}){destination}?",
                 chosen.len(),
                 plural(chosen.len()),
                 fmt::size(chosen_size)
@@ -580,6 +594,10 @@ pub fn run(options: Options) -> Result<()> {
             .interact()?
     {
         return Ok(());
+    }
+
+    if trash {
+        return run_trash(&chosen);
     }
 
     let deleted = Arc::new(Tally::default());
@@ -614,6 +632,62 @@ pub fn run(options: Options) -> Result<()> {
     }
     println!("{} Freed {}", "✔".green(), fmt::size(freed).bold());
     Ok(())
+}
+
+/// Moves folders to the Trash one at a time, then says how much emptying it frees.
+fn run_trash(chosen: &[&Junk]) -> Result<()> {
+    let moved = Arc::new(Tally::default());
+    let progress = Progress::start({
+        let (moved, folders) = (moved.clone(), chosen.len());
+        move |spinner| {
+            format!(
+                "{spinner} Moving to the Trash {} · {}/{folders} folders",
+                progress::bar(
+                    moved.count.load(Ordering::Relaxed) as f64 / folders as f64,
+                    24
+                ),
+                moved.count.load(Ordering::Relaxed),
+            )
+        }
+    });
+    let mut size = 0;
+    for junk in chosen {
+        match move_to_trash(junk) {
+            Ok(()) => size += junk.size,
+            Err(err) => eprintln!("{} {}: {err}", "✘".red(), fmt::path(&junk.path)),
+        }
+        moved.count.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(progress);
+    println!(
+        "{} Moved {} to the Trash. Empty it to get the space back.",
+        "✔".green(),
+        fmt::size(size).bold()
+    );
+    Ok(())
+}
+
+fn move_to_trash(junk: &Junk) -> io::Result<()> {
+    if demo::enabled() {
+        demo::delete(junk, &AtomicU64::new(0));
+        return Ok(());
+    }
+    trash_context().delete(&junk.path).map_err(io::Error::other)
+}
+
+/// On macOS, trashes through NSFileManager rather than Finder, which would ask for
+/// permission to control Finder and play the trash sound for every folder.
+#[cfg(target_os = "macos")]
+fn trash_context() -> trash::TrashContext {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut context = trash::TrashContext::new();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_context() -> trash::TrashContext {
+    trash::TrashContext::new()
 }
 
 fn plural(count: usize) -> &'static str {
