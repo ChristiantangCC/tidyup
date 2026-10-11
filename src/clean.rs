@@ -4,6 +4,7 @@
 //! `target/` or `build/` folder you made yourself is never touched.
 
 use std::{
+    collections::HashMap,
     env, fs, io,
     io::IsTerminal,
     os::unix::fs::MetadataExt,
@@ -205,16 +206,31 @@ fn measure(path: PathBuf, rule: &'static Rule) -> Junk {
     }
 }
 
-/// Space on disk that deleting `path` gives back. Files with other hard links (pnpm's
-/// store, for example) are left out, since deleting one link frees nothing.
+/// Space on disk that deleting `path` gives back. A hard-linked file counts only when all
+/// of its links are inside `path` (Cargo links outputs within `target/`); one linked from
+/// elsewhere, like pnpm's store, stays on disk after the delete.
 fn disk_usage(path: &Path) -> u64 {
-    WalkDir::new(path)
+    let mut total = 0;
+    // (device, inode) → (links seen inside `path`, size)
+    let mut linked: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+
+    for meta in WalkDir::new(path)
         .into_iter()
         .filter_map(Result::ok)
         .filter_map(|entry| entry.metadata().ok())
-        .filter(|meta| meta.is_dir() || meta.nlink() == 1)
-        .map(|meta| meta.blocks() * 512)
-        .sum()
+    {
+        let size = meta.blocks() * 512;
+        if meta.is_dir() || meta.nlink() == 1 {
+            total += size;
+            continue;
+        }
+        let (seen, _) = linked.entry((meta.dev(), meta.ino())).or_insert((0, size));
+        *seen += 1;
+        if *seen == meta.nlink() {
+            total += size;
+        }
+    }
+    total
 }
 
 /// Newest modification time among the project's other top-level entries.
@@ -429,6 +445,22 @@ mod tests {
         delete(&junk[0].path).unwrap();
         assert!(!root.join("node_modules").exists());
         assert!(root.join("package.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn counts_hard_links_only_when_all_are_inside() {
+        let root = temp_dir("links");
+        let inside = root.join("target");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("a"), vec![1u8; 200_000]).unwrap();
+        fs::hard_link(inside.join("a"), inside.join("a-link")).unwrap();
+        fs::write(inside.join("b"), vec![2u8; 300_000]).unwrap();
+        fs::hard_link(inside.join("b"), root.join("b-outside")).unwrap();
+
+        let size = disk_usage(&inside);
+        assert!((200_000..300_000).contains(&size), "got {size}");
 
         fs::remove_dir_all(root).unwrap();
     }
