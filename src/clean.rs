@@ -267,20 +267,27 @@ pub fn delete(path: &Path) -> io::Result<()> {
 /// Deletes `path`, adding each removed entry's size to `freed` as it goes. A hard-linked
 /// file counts once its last link inside `path` is removed, matching `disk_usage`.
 pub fn delete_counting(path: &Path, freed: &AtomicU64) -> io::Result<()> {
-    for entry in WalkDir::new(path).contents_first(true) {
-        let entry = entry?;
-        let size = entry
-            .metadata()
-            .ok()
-            .filter(|meta| meta.is_dir() || meta.nlink() == 1)
-            .map_or(0, |meta| meta.blocks() * 512);
-        if entry.file_type().is_dir() {
-            fs::remove_dir(entry.path())?;
-        } else {
-            fs::remove_file(entry.path())?;
+    remove_tree(path, freed)
+}
+
+/// Deletes a folder tree with its subfolders handled in parallel. Unlinking is limited by
+/// filesystem latency rather than CPU, so many deletes in flight beat one at a time.
+fn remove_tree(dir: &Path, freed: &AtomicU64) -> io::Result<()> {
+    let entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
+    entries.into_par_iter().try_for_each(|entry| {
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            return remove_tree(&entry.path(), freed);
         }
-        freed.fetch_add(size, Ordering::Relaxed);
-    }
+        fs::remove_file(entry.path())?;
+        if meta.nlink() == 1 {
+            freed.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
+        }
+        Ok(())
+    })?;
+    let size = fs::symlink_metadata(dir).map_or(0, |meta| meta.blocks() * 512);
+    fs::remove_dir(dir)?;
+    freed.fetch_add(size, Ordering::Relaxed);
     Ok(())
 }
 
