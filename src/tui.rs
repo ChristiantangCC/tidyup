@@ -18,6 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Tabs},
 };
+use rayon::prelude::*;
 
 use crate::{
     caches,
@@ -209,12 +210,13 @@ impl App {
             self.deleting.insert(junk.path.clone());
         }
         let tx = self.tx.clone();
+        // Separate folders delete fastest side by side; see `clean::delete_counting`.
         thread::spawn(move || {
-            for junk in jobs {
+            jobs.into_par_iter().for_each(|junk| {
                 let result = clean::delete(&junk).map_err(|e| e.to_string());
                 let (path, size) = (junk.path, junk.size);
                 let _ = tx.send(Msg::Deleted { path, size, result });
-            }
+            });
         });
     }
 

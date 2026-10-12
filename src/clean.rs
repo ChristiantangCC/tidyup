@@ -412,32 +412,60 @@ pub fn delete_counting(junk: &Junk, freed: &AtomicU64) -> io::Result<()> {
         freed.fetch_add(junk.size, Ordering::Relaxed);
         return Ok(());
     }
-    remove_tree(&junk.path, freed)
+    remove_tree(&junk.path, junk.size, freed)
 }
 
-/// Deletes a folder tree with its subfolders handled in parallel. Unlinking is limited by
-/// filesystem latency rather than CPU, so many deletes in flight beat one at a time.
-fn remove_tree(dir: &Path, freed: &AtomicU64) -> io::Result<()> {
-    let meta = fs::symlink_metadata(dir)?;
-    // Go keeps its module cache read-only on purpose; emptying a folder needs write access.
-    let mode = meta.permissions().mode();
+/// Deletes the folder `dir` of `size` bytes, adding to `freed` as each top-level entry goes.
+///
+/// One folder is deleted on one thread with std's `remove_dir_all`, which unlinks relative
+/// to open directory handles and never stats plain files. On APFS that beats a parallel
+/// walk: threads unlinking in the same tree mostly wait on each other. Parallelism pays off
+/// across separate folders instead, which callers do.
+fn remove_tree(dir: &Path, size: u64, freed: &AtomicU64) -> io::Result<()> {
+    let mut counted = 0;
+    match remove_children(dir, size, &mut counted, freed) {
+        // Go keeps its module cache read-only on purpose; emptying a folder needs write
+        // access, so unlock the tree and go again. Only that rare case pays for the extra walk.
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            make_writable(dir)?;
+            remove_children(dir, size, &mut counted, freed)?;
+        }
+        result => result?,
+    }
+    fs::remove_dir(dir)?;
+    freed.fetch_add(size.saturating_sub(counted), Ordering::Relaxed);
+    Ok(())
+}
+
+/// Removes everything inside `dir`, counting an even share of `size` per entry into `freed`
+/// (and `counted`), since sizing each entry would cost a walk of its own.
+fn remove_children(dir: &Path, size: u64, counted: &mut u64, freed: &AtomicU64) -> io::Result<()> {
+    let entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
+    let share = size / (entries.len() as u64 + 1);
+    for entry in entries {
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+        *counted += share;
+        freed.fetch_add(share, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Gives the owner full access to `dir` and every folder below it.
+fn make_writable(dir: &Path) -> io::Result<()> {
+    let mode = fs::symlink_metadata(dir)?.permissions().mode();
     if mode & 0o700 != 0o700 {
         fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700))?;
     }
-    let entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
-    entries.into_par_iter().try_for_each(|entry| {
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            return remove_tree(&entry.path(), freed);
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            make_writable(&entry.path())?;
         }
-        fs::remove_file(entry.path())?;
-        if meta.nlink() == 1 {
-            freed.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
-        }
-        Ok(())
-    })?;
-    fs::remove_dir(dir)?;
-    freed.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -797,8 +825,10 @@ mod tests {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
         }
 
-        remove_tree(&root.join("vendor"), &AtomicU64::new(0)).unwrap();
+        let freed = AtomicU64::new(0);
+        remove_tree(&root.join("vendor"), 1000, &freed).unwrap();
         assert!(!root.join("vendor").exists());
+        assert_eq!(freed.load(Ordering::Relaxed), 1000);
 
         fs::remove_dir_all(root).unwrap();
     }
