@@ -834,6 +834,82 @@ mod tests {
     }
 
     #[test]
+    fn deletes_without_following_symlinks_out_of_the_folder() {
+        let root = temp_dir("symlinks");
+        touch(&root.join("keep/precious.txt"));
+        touch(&root.join("target/debug/deep/file"));
+        std::os::unix::fs::symlink(root.join("keep"), root.join("target/link-dir")).unwrap();
+        std::os::unix::fs::symlink(root.join("keep"), root.join("target/debug/deep/link")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), root.join("target/dangling")).unwrap();
+
+        remove_tree(&root.join("target"), 10, &AtomicU64::new(0)).unwrap();
+        assert!(!root.join("target").exists());
+        assert!(root.join("keep/precious.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_deeply_read_only_trees_and_counts_the_whole_size() {
+        let root = temp_dir("deep-read-only");
+        let deep = root.join("pkg/mod/a/b/c");
+        touch(&deep.join("f.go"));
+        touch(&root.join("pkg/mod/top.txt"));
+        fs::set_permissions(deep.join("f.go"), fs::Permissions::from_mode(0o444)).unwrap();
+        for dir in [
+            &deep,
+            &root.join("pkg/mod/a/b"),
+            &root.join("pkg/mod/a"),
+            &root.join("pkg/mod"),
+        ] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let freed = AtomicU64::new(0);
+        remove_tree(&root.join("pkg"), 12_345, &freed).unwrap();
+        assert!(!root.join("pkg").exists());
+        assert_eq!(freed.load(Ordering::Relaxed), 12_345);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_many_folders_in_parallel() {
+        let root = temp_dir("parallel");
+        let junk: Vec<Junk> = (0..8)
+            .map(|i| {
+                let path = root.join(format!("p{i}/node_modules"));
+                for f in 0..50 {
+                    touch(&path.join(format!("pkg{f}/index.js")));
+                }
+                Junk {
+                    path,
+                    kind: "Node",
+                    size: 1000,
+                    last_used: SystemTime::now(),
+                    source: Source::Project,
+                }
+            })
+            .collect();
+
+        let freed = AtomicU64::new(0);
+        junk.par_iter()
+            .try_for_each(|j| delete_counting(j, &freed))
+            .unwrap();
+        assert_eq!(freed.load(Ordering::Relaxed), 8000);
+        assert!(junk.iter().all(|j| !j.path.exists()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_missing_folders() {
+        let root = temp_dir("missing");
+        assert!(remove_tree(&root.join("nope"), 1, &AtomicU64::new(0)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn counts_hard_links_only_when_all_are_inside() {
         let root = temp_dir("links");
         let inside = root.join("target");
