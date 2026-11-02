@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     demo,
     fmt::{self, Paint},
+    receipt,
 };
 
 /// How long a process gets to shut down after SIGTERM before it gets SIGKILL.
@@ -266,6 +267,7 @@ pub fn print(all: bool) -> Result<()> {
 pub fn kill(ports: &[u16], force: bool) -> Result<()> {
     let listeners = list()?;
     let mut failed = false;
+    let mut freed: Vec<&Listener> = Vec::new();
 
     for &port in ports {
         let holders: Vec<_> = listeners.iter().filter(|l| l.port == port).collect();
@@ -279,8 +281,14 @@ pub fn kill(ports: &[u16], force: bool) -> Result<()> {
                 None => format!("{} (pid {})", l.label(), l.pid),
             };
             match stop_listener(l, force) {
-                Ok(Outcome::Stopped) => println!("{} :{port} stopped {who}", "✔".green()),
-                Ok(Outcome::Forced) => println!("{} :{port} force-killed {who}", "✔".yellow()),
+                Ok(Outcome::Stopped) => {
+                    freed.push(l);
+                    println!("{} :{port} stopped {who}", "✔".green());
+                }
+                Ok(Outcome::Forced) => {
+                    freed.push(l);
+                    println!("{} :{port} force-killed {who}", "✔".yellow());
+                }
                 Err(err) => {
                     failed = true;
                     eprintln!("{} :{port} {who}: {err:#}", "✘".red());
@@ -289,13 +297,15 @@ pub fn kill(ports: &[u16], force: bool) -> Result<()> {
         }
     }
 
+    receipt::print(&receipt::ports(ports.len(), &freed));
+
     if failed {
         std::process::exit(1);
     }
     Ok(())
 }
 
-fn truncate(text: &str, width: usize) -> String {
+pub(crate) fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
     }
@@ -305,7 +315,7 @@ fn truncate(text: &str, width: usize) -> String {
 }
 
 /// Runs a command and returns its stdout. Exit status is ignored: lsof exits 1 when nothing matches.
-fn run(program: &str, args: &[&str]) -> Result<String> {
+pub(crate) fn run(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -355,7 +365,7 @@ fn parse_lsof(output: &str) -> Vec<Listener> {
     found.into_values().collect()
 }
 
-fn parse_cwds(output: &str) -> HashMap<u32, PathBuf> {
+pub(crate) fn parse_cwds(output: &str) -> HashMap<u32, PathBuf> {
     let mut cwds = HashMap::new();
     let mut pid = 0;
     for (tag, value) in lsof_fields(output) {
@@ -422,7 +432,7 @@ fn parse_ps(output: &str) -> HashMap<u32, Stats> {
         .collect()
 }
 
-fn next_word(text: &str) -> (&str, &str) {
+pub(crate) fn next_word(text: &str) -> (&str, &str) {
     let text = text.trim_start();
     match text.find(char::is_whitespace) {
         Some(end) => (&text[..end], text[end..].trim_start()),
@@ -431,7 +441,7 @@ fn next_word(text: &str) -> (&str, &str) {
 }
 
 /// Parses ps elapsed time, `[[dd-]hh:]mm:ss`, into seconds.
-fn parse_etime(etime: &str) -> Option<u64> {
+pub(crate) fn parse_etime(etime: &str) -> Option<u64> {
     let (days, clock) = match etime.split_once('-') {
         Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
         None => (0, etime),

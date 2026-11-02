@@ -15,6 +15,7 @@ use crate::{
     clean::{Junk, Source},
     ports::Listener,
     ports::Outcome,
+    strays::Stray,
 };
 
 const MB: u64 = 1_000_000;
@@ -168,6 +169,47 @@ fn fake(
         memory: Some(mb * MB),
         container: None,
     }
+}
+
+/// Leftover processes: a cancelled build still spinning, and an idle watcher.
+pub fn strays() -> Vec<Stray> {
+    let code = home().join("code");
+    let stopped = stopped();
+    [
+        Stray {
+            kind: "Next.js build worker",
+            kind_count: 11,
+            project: Some(code.join("acme-shop")),
+            project_gone: false,
+            pids: (61201..61212).collect(),
+            cpu: 352.0,
+            memory: 1340 * MB,
+            uptime: 5468,
+        },
+        Stray {
+            kind: "esbuild service",
+            kind_count: 1,
+            project: Some(code.join("old-prototype")),
+            project_gone: true,
+            pids: vec![61540],
+            cpu: 4.0,
+            memory: 38 * MB,
+            uptime: 3 * DAY + 7200,
+        },
+        Stray {
+            kind: "tsc --watch",
+            kind_count: 1,
+            project: Some(code.join("edge-worker")),
+            project_gone: false,
+            pids: vec![61688],
+            cpu: 0.4,
+            memory: 210 * MB,
+            uptime: DAY + 1800,
+        },
+    ]
+    .into_iter()
+    .filter(|s| !s.pids.iter().any(|pid| stopped.contains(pid)))
+    .collect()
 }
 
 /// Pretends to stop `pid`. The Python API "ignores" SIGTERM to show the force path.
