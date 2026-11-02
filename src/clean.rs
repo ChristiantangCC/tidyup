@@ -25,6 +25,7 @@ use crate::{
     caches, demo,
     fmt::{self, Paint},
     progress::{self, Progress},
+    receipt,
 };
 
 /// A deletable folder `dir`, recognised by one of `markers` in the same parent folder.
@@ -624,8 +625,13 @@ pub fn run(options: Options) -> Result<()> {
         return Ok(());
     }
 
+    let started = std::time::Instant::now();
+    // Demo mode deletes nothing, so the disk wouldn't change.
+    let disk_before = (!demo::enabled())
+        .then(|| receipt::disk_free(&root))
+        .flatten();
     if trash {
-        return run_trash(&chosen);
+        return run_trash(&chosen, &root, started);
     }
 
     let deleted = Arc::new(Tally::default());
@@ -651,19 +657,31 @@ pub fn run(options: Options) -> Result<()> {
         })
         .collect();
     drop(progress);
-    let mut freed = 0;
+    let mut done = Vec::new();
+    let mut failed = 0;
     for (junk, result) in results {
         match result {
-            Ok(()) => freed += junk.size,
-            Err(err) => eprintln!("{} {}: {err}", "✘".red(), fmt::path(&junk.path)),
+            Ok(()) => done.push(junk),
+            Err(err) => {
+                failed += 1;
+                eprintln!("{} {}: {err}", "✘".red(), fmt::path(&junk.path));
+            }
         }
     }
-    println!("{} Freed {}", "✔".green(), fmt::size(freed).bold());
+    let disk = disk_before.zip(receipt::disk_free(&root));
+    receipt::print(&receipt::clean(&receipt::Clean {
+        root: &root,
+        done,
+        failed,
+        elapsed: started.elapsed(),
+        disk,
+        trash: false,
+    }));
     Ok(())
 }
 
 /// Moves folders to the Trash one at a time, then says how much emptying it frees.
-fn run_trash(chosen: &[&Junk]) -> Result<()> {
+fn run_trash(chosen: &[&Junk], root: &Path, started: std::time::Instant) -> Result<()> {
     let moved = Arc::new(Tally::default());
     let progress = Progress::start({
         let (moved, folders) = (moved.clone(), chosen.len());
@@ -678,20 +696,27 @@ fn run_trash(chosen: &[&Junk]) -> Result<()> {
             )
         }
     });
-    let mut size = 0;
+    let mut done = Vec::new();
+    let mut failed = 0;
     for junk in chosen {
         match move_to_trash(junk) {
-            Ok(()) => size += junk.size,
-            Err(err) => eprintln!("{} {}: {err}", "✘".red(), fmt::path(&junk.path)),
+            Ok(()) => done.push(*junk),
+            Err(err) => {
+                failed += 1;
+                eprintln!("{} {}: {err}", "✘".red(), fmt::path(&junk.path));
+            }
         }
         moved.count.fetch_add(1, Ordering::Relaxed);
     }
     drop(progress);
-    println!(
-        "{} Moved {} to the Trash. Empty it to get the space back.",
-        "✔".green(),
-        fmt::size(size).bold()
-    );
+    receipt::print(&receipt::clean(&receipt::Clean {
+        root,
+        done,
+        failed,
+        elapsed: started.elapsed(),
+        disk: None,
+        trash: true,
+    }));
     Ok(())
 }
 

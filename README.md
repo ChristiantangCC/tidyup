@@ -4,7 +4,7 @@
 
 **Your dev machine, minus the mess.**
 
-Kill whatever is squatting on port 3000. Delete the 40 GB of `node_modules` and `target` folders from projects you forgot about. Start your whole dev stack with one command.
+Kill whatever is squatting on port 3000. Delete the 40 GB of `node_modules` and `target` folders from projects you forgot about. Stop the build workers still spinning your fan an hour after you cancelled the build. Start your whole dev stack with one command.
 
 [![CI](https://github.com/ChristiantangCC/tidyup/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristiantangCC/tidyup/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/tidyup.svg)](https://crates.io/crates/tidyup)
@@ -27,9 +27,11 @@ Error: listen EADDRINUSE: address already in use :::3000
 Your disk is almost full.
 ```
 
-The first one sends you to Stack Overflow for the `lsof -ti :3000 | xargs kill` incantation, again. The second one is 30 old projects, each with a gigabyte of `node_modules`, a few Rust `target` folders at 5 GB each, and a `.venv` from that weekend you tried machine learning.
+And the one with no error message at all: the fan spins up and the laptop gets hot, because a build you cancelled an hour ago left eleven `node` workers running at full speed.
 
-tidyup handles both: one small binary, no runtime, no config needed.
+The first one sends you to Stack Overflow for the `lsof -ti :3000 | xargs kill` incantation, again. The second one is 30 old projects, each with a gigabyte of `node_modules`, a few Rust `target` folders at 5 GB each, and a `.venv` from that weekend you tried machine learning. The third one means digging through Activity Monitor for processes that all just say `node`.
+
+tidyup handles all three: one small binary, no runtime, no config needed.
 
 ## Install
 
@@ -54,6 +56,31 @@ tidyup kill 3000 -f   # skip the polite part
 - **Hides system noise.** AirPlay, Spotify and other processes running from `/` stay out of the list unless you pass `--all`.
 - **Stops nicely first.** SIGTERM, a 3 second wait, then SIGKILL only if the process is still around. That's what happened to the stubborn Python server above.
 - **Knows Docker.** A port published by a container shows the container's name, and stopping it runs `docker stop` on that container instead of killing Docker itself.
+
+## Strays: leftover processes eating your CPU
+
+```sh
+tidyup strays                          # what's left over, hottest first
+tidyup strays --stop                   # pick which to stop, then confirm
+tidyup strays --stop --yes             # stop everything listed
+tidyup strays --cpu-above 20 --older-than 30m
+```
+
+```
+         CPU      MEM  RUNNING  WHAT                         PROJECT
+●  3.5 cores  1.3 GB   1h 31m  11 × Next.js build worker    ~/code/acme-shop
+          4%    38 MB    3d 2h  esbuild service              ~/code/old-prototype (deleted)
+          0%   210 MB   1d 0h  tsc --watch                  ~/code/edge-worker
+13 processes in 3 groups, using 3.6 cores
+```
+
+A stray is a dev process whose parent is gone: the terminal was closed, the build was cancelled, the editor crashed, but its workers, watchers and dev servers kept running. They listen on no port, so `tidyup ports` can't see them.
+
+- **Only clearly dev tooling.** Next.js and Jest workers, Vite, webpack, Turbopack, esbuild, `tsc --watch`, `tsserver`, nodemon, tsx, ESLint, rust-analyzer, `cargo watch`, and anything running from a project's `node_modules`, `target` or `.venv`. Plus every process those started.
+- **Only yours, only orphans.** A process whose parent is still alive (your terminal, your editor) is never listed. Neither are apps (`.app` bundles), system processes or globally installed tools.
+- **Grouped by run.** The eleven workers of one build are one row, stopped together.
+- **Flags what's hot.** `●` marks a group that has used half a core or more for 10 minutes: probably your fan. A project folder that no longer exists (a deleted checkout or temp folder) is marked `(deleted)`.
+- **Stops nicely first**, like `tidyup kill`: SIGTERM, 3 seconds, then SIGKILL. Build workers often ignore SIGTERM, so expect "force-killed".
 
 ## Clean: get your disk back
 
@@ -136,22 +163,22 @@ tidyup up web api  # just these
 
 ## The dashboard
 
-Run `tidyup` with no arguments (or `tidyup ui ~/code`) for both tools in one screen. Ports refresh every 2 seconds; the Clean tab fills in while it scans.
+Run `tidyup` with no arguments (or `tidyup ui ~/code`) for all three in one screen. Ports and strays refresh every 2 seconds; the Clean tab fills in while it scans. When a stray is hot, the Strays tab gets a red `●` so you see it from any tab.
 
-| Ports tab | | Clean tab | |
-| --- | --- | --- | --- |
-| `x` | stop | `space` | mark |
-| `X` | force kill | `a` | mark all |
-| `a` | show/hide system processes | `d` | delete marked (or current) |
-| `r` | refresh | `s` / `t` | sort by size / age, again to flip |
-| | | `c` | show/hide global caches |
-| | | `r` | rescan |
+| Ports tab | | Clean tab | | Strays tab | |
+| --- | --- | --- | --- | --- | --- |
+| `x` | stop | `space` | mark | `x` | stop group |
+| `X` | force kill | `a` | mark all | `X` | force kill group |
+| `a` | show/hide system processes | `d` | delete marked (or current) | `r` | refresh |
+| `r` | refresh | `s` / `t` | sort by size / age, again to flip | | |
+| | | `c` | show/hide global caches | | |
+| | | `r` | rescan | | |
 
-`tab` or `1`/`2` switches tabs, `↑↓` or `j`/`k` moves, `q` quits.
+`tab` or `1`/`2`/`3` switches tabs, `↑↓` or `j`/`k` moves, `q` quits.
 
 ## How it compares
 
-tidyup does three jobs that usually take three tools. If you only need one of them, these are good too.
+tidyup does jobs that usually take several tools. If you only need one of them, these are good too.
 
 | | tidyup | [kondo](https://github.com/tbillington/kondo) | [npkill](https://github.com/voidcosmos/npkill) | [kill-port](https://github.com/tiaanduplessis/kill-port) |
 | --- | --- | --- | --- | --- |
@@ -162,6 +189,7 @@ tidyup does three jobs that usually take three tools. If you only need one of th
 | Dry run | Yes | Yes | Yes | – |
 | Package manager and Docker caches | Yes, with `--caches` | – | Some, matched by folder name | – |
 | Stops what's on a port | SIGTERM, then SIGKILL after 3 s | – | – | SIGKILL |
+| Stops orphaned build workers and watchers | `tidyup strays` | – | – | – |
 | Starts your dev stack | `tidyup up` | – | – | – |
 | Install | `cargo install` | Homebrew, winget, cargo | `npx` | `npx` |
 | Windows | No | Yes | Yes | Yes |

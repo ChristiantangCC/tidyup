@@ -25,6 +25,8 @@ use crate::{
     clean::{self, Junk},
     fmt,
     ports::{self, Listener, Outcome},
+    receipt,
+    strays::{self, StopReport, Stray},
 };
 
 const REFRESH: Duration = Duration::from_secs(2);
@@ -44,6 +46,7 @@ pub fn run(root: PathBuf) -> Result<()> {
 enum Tab {
     Ports,
     Clean,
+    Strays,
 }
 
 /// Column the Clean tab is sorted by.
@@ -56,6 +59,11 @@ enum SortBy {
 /// Results coming back from background threads.
 enum Msg {
     Ports(Result<Vec<Listener>, String>),
+    Strays(Result<Vec<Stray>, String>),
+    StraysStopped {
+        stray: Stray,
+        report: StopReport,
+    },
     Found {
         scan: u64,
         junk: Junk,
@@ -102,6 +110,45 @@ struct App {
     scanning: bool,
     /// Folders waiting for a yes/no before deletion.
     confirm: Option<Vec<PathBuf>>,
+
+    strays: Vec<Stray>,
+    strays_table: TableState,
+    strays_refreshed: bool,
+    /// Pids being stopped, so a refresh doesn't offer them again meanwhile.
+    stopping: HashSet<u32>,
+
+    /// What this session got back, shown in the header.
+    session: Session,
+}
+
+/// Running totals for the header: what you've freed since opening the dashboard.
+#[derive(Default)]
+struct Session {
+    bytes: u64,
+    ports: usize,
+    /// CPU of stopped strays, in % of one core.
+    cpu: f32,
+}
+
+impl Session {
+    /// `✔ 41.8 GB · 2 ports · 3.6 cores freed this session`, or nothing yet.
+    fn text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.bytes > 0 {
+            parts.push(fmt::size(self.bytes));
+        }
+        if self.ports > 0 {
+            parts.push(format!(
+                "{} port{}",
+                self.ports,
+                if self.ports == 1 { "" } else { "s" }
+            ));
+        }
+        if self.cpu >= 1.0 {
+            parts.push(receipt::cpu_text(self.cpu));
+        }
+        (!parts.is_empty()).then(|| format!("✔ {} freed this session ", parts.join(" · ")))
+    }
 }
 
 impl App {
@@ -129,6 +176,11 @@ impl App {
             scan: 0,
             scanning: false,
             confirm: None,
+            strays: Vec::new(),
+            strays_table: TableState::default().with_selected(0),
+            strays_refreshed: false,
+            stopping: HashSet::new(),
+            session: Session::default(),
         }
     }
 
@@ -152,11 +204,29 @@ impl App {
 
     // ── background work ────────────────────────────────────────────────
 
+    /// Refreshes ports and strays together: both come from `ps`/`lsof`.
     fn refresh_ports(&mut self) {
         self.refreshing = true;
         let tx = self.tx.clone();
         thread::spawn(move || {
             let _ = tx.send(Msg::Ports(ports::list().map_err(|e| format!("{e:#}"))));
+            let _ = tx.send(Msg::Strays(strays::list().map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    fn stop_selected_stray(&mut self, force: bool) {
+        let Some(stray) = self.selected_stray().cloned() else {
+            return;
+        };
+        if stray.pids.iter().any(|pid| self.stopping.contains(pid)) {
+            return;
+        }
+        self.stopping.extend(stray.pids.iter().copied());
+        self.set_status(format!("Stopping {}…", stray.label()));
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let report = strays::stop(&stray, force);
+            let _ = tx.send(Msg::StraysStopped { stray, report });
         });
     }
 
@@ -224,12 +294,36 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Ports(result) => {
-                    self.refreshing = false;
                     self.refreshed = Some(Instant::now());
                     match result {
                         Ok(ports) => self.ports = ports,
                         Err(err) => self.set_status(err),
                     }
+                }
+                Msg::Strays(result) => {
+                    self.refreshing = false;
+                    self.strays_refreshed = true;
+                    match result {
+                        Ok(strays) => self.strays = strays,
+                        Err(err) => self.set_status(err),
+                    }
+                }
+                Msg::StraysStopped { stray, report } => {
+                    for pid in &stray.pids {
+                        self.stopping.remove(pid);
+                    }
+                    let name = stray.label();
+                    if report.failed.is_empty() {
+                        self.session.cpu += stray.cpu;
+                    }
+                    self.set_status(if !report.failed.is_empty() {
+                        format!("Could not stop all of {name}: {}", report.failed.join("; "))
+                    } else if report.forced > 0 {
+                        format!("Force-killed {name}")
+                    } else {
+                        format!("Stopped {name}")
+                    });
+                    self.refresh_ports();
                 }
                 Msg::Found { scan, junk } if scan == self.scan => {
                     self.junk.push(junk);
@@ -239,6 +333,9 @@ impl App {
                 Msg::Found { .. } | Msg::ScanDone { .. } => {}
                 Msg::Stopped { listener, result } => {
                     let name = format!("{} on :{}", listener.label(), listener.port);
+                    if result.is_ok() {
+                        self.session.ports += 1;
+                    }
                     self.set_status(match result {
                         Ok(Outcome::Stopped) => format!("Stopped {name}"),
                         Ok(Outcome::Forced) => format!("Force-killed {name}"),
@@ -251,6 +348,7 @@ impl App {
                     let shown = clean::display(&path, &self.root);
                     match result {
                         Ok(()) => {
+                            self.session.bytes += size;
                             self.junk.retain(|j| j.path != path);
                             self.set_status(format!("Deleted {shown}, freed {}", fmt::size(size)));
                         }
@@ -277,14 +375,23 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab => {
                 self.tab = match self.tab {
                     Tab::Ports => Tab::Clean,
+                    Tab::Clean => Tab::Strays,
+                    Tab::Strays => Tab::Ports,
+                }
+            }
+            KeyCode::BackTab => {
+                self.tab = match self.tab {
+                    Tab::Ports => Tab::Strays,
                     Tab::Clean => Tab::Ports,
+                    Tab::Strays => Tab::Clean,
                 }
             }
             KeyCode::Char('1') => self.tab = Tab::Ports,
             KeyCode::Char('2') => self.tab = Tab::Clean,
+            KeyCode::Char('3') => self.tab = Tab::Strays,
             KeyCode::Down | KeyCode::Char('j') => self.table().select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.table().select_previous(),
             KeyCode::Home | KeyCode::Char('g') => self.table().select_first(),
@@ -292,6 +399,7 @@ impl App {
             code => match self.tab {
                 Tab::Ports => self.on_ports_key(code),
                 Tab::Clean => self.on_clean_key(code),
+                Tab::Strays => self.on_strays_key(code),
             },
         }
     }
@@ -301,6 +409,15 @@ impl App {
             KeyCode::Char('x') => self.stop_selected(false),
             KeyCode::Char('X') => self.stop_selected(true),
             KeyCode::Char('a') => self.show_all = !self.show_all,
+            KeyCode::Char('r') => self.refresh_ports(),
+            _ => {}
+        }
+    }
+
+    fn on_strays_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('x') => self.stop_selected_stray(false),
+            KeyCode::Char('X') => self.stop_selected_stray(true),
             KeyCode::Char('r') => self.refresh_ports(),
             _ => {}
         }
@@ -357,7 +474,12 @@ impl App {
         match self.tab {
             Tab::Ports => &mut self.ports_table,
             Tab::Clean => &mut self.junk_table,
+            Tab::Strays => &mut self.strays_table,
         }
+    }
+
+    fn selected_stray(&self) -> Option<&Stray> {
+        self.strays.get(self.strays_table.selected()?)
     }
 
     fn visible_ports(&self) -> Vec<&Listener> {
@@ -425,6 +547,7 @@ impl App {
         match self.tab {
             Tab::Ports => self.draw_ports(frame, body),
             Tab::Clean => self.draw_clean(frame, body),
+            Tab::Strays => self.draw_strays(frame, body),
         }
         self.draw_footer(frame, footer);
         if let Some(paths) = &self.confirm {
@@ -433,15 +556,28 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let [title, tabs] =
-            Layout::horizontal([Constraint::Length(8), Constraint::Min(0)]).areas(area);
+        let tally = self.session.text().unwrap_or_default();
+        let [title, tabs, totals] = Layout::horizontal([
+            Constraint::Length(8),
+            Constraint::Min(0),
+            Constraint::Length(tally.chars().count() as u16),
+        ])
+        .areas(area);
+        frame.render_widget(Line::from(tally).green().right_aligned(), totals);
         frame.render_widget(Span::from(" tidyup").bold().cyan(), title);
         let selected = match self.tab {
             Tab::Ports => 0,
             Tab::Clean => 1,
+            Tab::Strays => 2,
+        };
+        // A hot stray is why you opened tidyup: mark the tab so it's seen from anywhere.
+        let strays_tab = if self.strays.iter().any(Stray::is_hot) {
+            Line::from(vec![Span::from("3 Strays "), Span::from("●").red()])
+        } else {
+            Line::from("3 Strays")
         };
         frame.render_widget(
-            Tabs::new(["1 Ports", "2 Clean"])
+            Tabs::new([Line::from("1 Ports"), Line::from("2 Clean"), strays_tab])
                 .select(selected)
                 .highlight_style(Style::new().bold().reversed())
                 .divider("│"),
@@ -503,6 +639,62 @@ impl App {
         .row_highlight_style(Style::new().reversed())
         .highlight_symbol("› ");
         frame.render_stateful_widget(table, area, &mut self.ports_table);
+    }
+
+    fn draw_strays(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered().title(format!(
+            " Leftover dev processes · {} ",
+            strays::summary(&self.strays)
+        ));
+        if self.strays.is_empty() {
+            let text = if self.strays_refreshed {
+                "No leftover dev processes."
+            } else {
+                "Looking…"
+            };
+            frame.render_widget(Paragraph::new(text).dim().block(block), area);
+            return;
+        }
+
+        let rows: Vec<Row> = self
+            .strays
+            .iter()
+            .map(|s| {
+                let busy = s.pids.iter().any(|pid| self.stopping.contains(pid));
+                let (mark, style) = if busy {
+                    ("…", Style::new().dim())
+                } else if s.is_hot() {
+                    ("●", Style::new().red())
+                } else {
+                    (" ", Style::new())
+                };
+                Row::new([
+                    Cell::from(mark),
+                    Cell::from(s.cpu_text()).style(Style::new().bold()),
+                    Cell::from(fmt::size(s.memory)),
+                    Cell::from(fmt::duration(s.uptime)),
+                    Cell::from(s.label()),
+                    Cell::from(s.folder()),
+                ])
+                .style(style)
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(30),
+                Constraint::Fill(1),
+            ],
+        )
+        .header(Row::new(["", "CPU", "MEM", "RUNNING", "WHAT", "PROJECT"]).dim())
+        .block(block)
+        .row_highlight_style(Style::new().reversed())
+        .highlight_symbol("› ");
+        frame.render_stateful_widget(table, area, &mut self.strays_table);
     }
 
     fn draw_clean(&mut self, frame: &mut Frame, area: Rect) {
@@ -644,6 +836,14 @@ impl App {
                 ("tab", "switch"),
                 ("q", "quit"),
             ],
+            Tab::Strays => &[
+                ("↑↓", "move"),
+                ("x", "stop group"),
+                ("X", "force kill"),
+                ("r", "refresh"),
+                ("tab", "switch"),
+                ("q", "quit"),
+            ],
         };
         let spans: Vec<Span> = keys
             .iter()
@@ -695,4 +895,24 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     area
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    #[test]
+    fn session_tally_lists_only_what_was_freed() {
+        let mut session = Session::default();
+        assert_eq!(session.text(), None);
+        session.ports = 1;
+        assert_eq!(session.text().unwrap(), "✔ 1 port freed this session ");
+        session.bytes = 41_800_000_000;
+        session.ports = 2;
+        session.cpu = 360.0;
+        assert_eq!(
+            session.text().unwrap(),
+            "✔ 42 GB · 2 ports · 3.6 cores freed this session "
+        );
+    }
 }
