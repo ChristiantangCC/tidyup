@@ -1,6 +1,6 @@
 [package]
 name = "tidyup"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Free up ports, disk space and CPU from your dev projects: kill port hogs, delete node_modules/target folders, stop leftover build workers, start your dev stack"
